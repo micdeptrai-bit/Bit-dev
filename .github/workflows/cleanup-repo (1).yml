@@ -20,7 +20,8 @@ name: Dọn workflow rác và file rác
 #     - shared/src/commonMain/kotlin/com/music/bitchord/automix-bpm-key.yml: workflow cũ lạc trong thư mục mã nguồn.
 #   Tùy chọn (mặc định KHÔNG xóa): automix-fixes.yml (patch độ tin cậy beat/Camelot, chạy riêng được).
 #
-# GIỮ NGUYÊN: android.yml, dev-benchmark (1).yml, automix-all-in-one (2).yml (workflow manual-mix bắt buộc cần nó),
+# GIỮ NGUYÊN: android.yml, dev-benchmark (1).yml (PHẢI là bản mới dựng từ automix-manual-mix, không thì dọn tự dừng),
+# automix-all-in-one (2).yml (cả manual-mix lẫn Bit Dev APK bắt buộc cần nó),
 # bản manual-mix mới nhất, và toàn bộ mã nguồn, ảnh, tài liệu. Thiếu file bắt buộc là dừng, chưa xóa gì.
 # Mọi file xóa vẫn còn trong lịch sử git nên khôi phục lại được.
 #
@@ -108,6 +109,16 @@ jobs:
             echo "::error::'$KEEP_MM' không có phần publish_release, có vẻ là bản cũ. Hãy nhập đúng bản mới nhất vào keep_manual_mix. Dừng."
             exit 1
           fi
+
+          # Bản dev-benchmark cũ dựng APK bằng cách đọc workflow automix-verdict-line. Xóa verdict-line khi nó còn
+          # dùng sẽ làm hỏng "Bit Dev APK", nên dừng và bắt thay bản dev-benchmark mới trước.
+          for d in "$WF"/dev-benchmark*.yml; do
+            [ -f "$d" ] || continue
+            if grep -q "loop mix + gom" "$d"; then
+              echo "::error::'$(basename "$d")' vẫn dựng bản từ automix-verdict-line. Hãy thay nó bằng bản dev-benchmark mới (dựng từ automix-manual-mix) rồi chạy dọn lại. Dừng, chưa xóa gì."
+              exit 1
+            fi
+          done
 
           # ---- Danh sách xóa ----
           WF_DELETE=()
