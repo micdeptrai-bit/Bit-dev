@@ -4,6 +4,13 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
+    # Commit chi dung vao workflow, tai lieu, zip hay yml khong con tu dong build + dang Releases nua
+    # (truoc day moi lan tai mot file workflow len main la ra mot ban APK moi). Muon build thi bam Run workflow.
+    paths-ignore:
+      - '.github/**'
+      - '**.md'
+      - '**.zip'
+      - '**.yml'
 
 permissions:
   contents: write
@@ -21,8 +28,9 @@ jobs:
           distribution: 'temurin'
           cache: gradle
 
-      # Cac tinh nang Automix / man hinh khoa / AI DJ KHONG nam trong main: chung nam trong
-      # patch cua cac workflow automix-*. Buoc nay dung lai dung chuoi do truoc khi build.
+      # Cac tinh nang Automix / man hinh khoa / AI DJ / chinh tay diem mix KHONG nam trong main: chung nam trong
+      # patch cua workflow automix-all-in-one va automix-manual-mix. Buoc nay dung lai dung chuoi do truoc khi build,
+      # nen ban APK nay co du: all-in-one + dong trang thai loop mix, gom cai dat va chinh tay diem mix.
       - name: Automix features (dung lai tu workflow automix-*)
         shell: bash
         run: |
@@ -40,13 +48,22 @@ jobs:
                       return line
               return ""
 
+          def text(p):
+              return open(p, encoding="utf8", errors="replace").read()
+
           wf = glob.glob(".github/workflows/*.yml")
-          verdict = sorted(p for p in wf if "loop mix + gom" in title(p))
+          manual = [p for p in wf if "chỉnh tay điểm mix" in title(p)]
           chain = sorted(p for p in wf if os.path.basename(p).startswith("automix-all-in-one"))
-          if not verdict or not chain:
-              sys.exit("::error::Khong thay workflow automix-verdict-line / automix-all-in-one trong .github/workflows")
+          if not manual or not chain:
+              sys.exit("::error::Khong thay workflow automix-manual-mix / automix-all-in-one trong .github/workflows")
           chain = next((p for p in chain if "(2)" in p), chain[0])
-          print("verdict:", verdict, "| chain:", chain)
+          # Neu con nhieu ban trung ten thi thu ban moi nhat truoc (co dang Releases, tai libusb du phong, keo tren thanh tua).
+          cands = sorted(
+              manual,
+              key=lambda p: ("publish_release" in text(p), "git clone --depth 1" in text(p), "markerWindow(" in text(p), len(text(p))),
+              reverse=True,
+          )
+          print("manual-mix:", cands, "| chain:", chain)
 
           def load_steps(p):
               d = yaml.safe_load(open(p, encoding="utf8"))
@@ -59,8 +76,6 @@ jobs:
               return r.returncode == 0
 
           env = dict(os.environ, CHAIN_FILE=os.path.basename(chain))
-          # Ban "(2) (1)" la ban patch dung; cac ban khac thu sau neu ban do khong ap duoc.
-          cands = sorted(verdict, key=lambda p: ("(2) (1)" not in p, p))
           if not run_step(load_steps(cands[0])["Rebuild the all-in-one features"], env):
               sys.exit("::error::Khong dung lai duoc chuoi all-in-one")
           git = ["git", "-c", "user.name=ci", "-c", "user.email=ci@example.com"]
@@ -69,12 +84,13 @@ jobs:
           for v in cands:
               print("Thu:", v, flush=True)
               st = load_steps(v)
-              if run_step(st["Write the patches"], env) and run_step(st["Apply the patches"], env):
+              write = st.get("Write the patch") or st.get("Write the patches")
+              if write and run_step(write, env) and run_step(st["Apply the patches"], env):
                   print("OK:", v)
                   break
               subprocess.run(["git", "reset", "-q", "--hard", "HEAD"], check=True)
           else:
-              sys.exit("::error::Khong ban patch automix-verdict-line nao ap duoc")
+              sys.exit("::error::Khong ban patch automix-manual-mix nao ap duoc")
           PY
 
       # Doi ten + version ngay luc build, khong can sua file nao khac.
@@ -132,7 +148,62 @@ jobs:
           } > keystore.properties
 
       - run: chmod +x gradlew
-      - run: ./gradlew assembleDevRelease
+      - name: Pre-fetch libusb (GitHub release downloads keep returning 504)
+        run: |
+          # CMake tai libusb 1.0.27 tu trang release cua GitHub luc cau hinh, va trang do dang tra 504.
+          # Thu lan luot: GitHub, SourceForge, kho goi Debian (cung mot file, kiem tra bang ma bam SHA256 ma
+          # CMakeLists da ghim). Het cach thi git clone dung tag v1.0.27 va dong goi lai (khi do bo dong ghim ma bam).
+          D="$HOME/libusb-cache"
+          F="$D/libusb-1.0.27.tar.bz2"
+          SHA="ffaa41d741a8a3bee244ac8e54a72ea05bf2879663c098c82fc5757853441575"
+          GH="https://github.com/libusb/libusb/releases/download/v1.0.27/libusb-1.0.27.tar.bz2"
+          CM=app/src/main/cpp/CMakeLists.txt
+          mkdir -p "$D"
+          OK=0
+          for round in 1 2; do
+            for U in "$GH" \
+                     "https://downloads.sourceforge.net/project/libusb/libusb-1.0/libusb-1.0.27/libusb-1.0.27.tar.bz2" \
+                     "https://deb.debian.org/debian/pool/main/libu/libusb-1.0/libusb-1.0_1.0.27.orig.tar.bz2"; do
+              if curl -fsSL --retry 2 --retry-delay 3 --max-time 120 -o "$F" "$U" \
+                 && echo "$SHA  $F" | sha256sum -c - > /dev/null 2>&1; then
+                echo "Da tai libusb tu: $U"
+                OK=1
+                break 2
+              fi
+              echo "Khong tai duoc (hoac sai ma bam) tu: $U"
+              rm -f "$F"
+            done
+            sleep 15
+          done
+          if [ "$OK" = 1 ]; then
+            sed -i "s#$GH#file://$F#" "$CM"
+          else
+            echo "Ca ba nguon tai deu hong, thu git clone tag v1.0.27"
+            for i in 1 2 3; do
+              rm -rf "$D/libusb-1.0.27"
+              if git clone --depth 1 --branch v1.0.27 https://github.com/libusb/libusb.git "$D/libusb-1.0.27"; then
+                rm -rf "$D/libusb-1.0.27/.git"
+                tar -C "$D" -cjf "$D/libusb-git.tar.bz2" libusb-1.0.27
+                # Ban dong goi lai khong cung ma bam voi ban phat hanh, nen bo dong ghim ma bam.
+                sed -i "s#$GH#file://$D/libusb-git.tar.bz2#; s#URL_HASH SHA256=$SHA)#)#" "$CM"
+                echo "Da dung libusb tu git clone"
+                break
+              fi
+              sleep 20
+            done
+          fi
+          sed -n '/FetchContent_Declare(libusb/,/FetchContent_MakeAvailable(libusb)/p' "$CM"
+
+      - name: Build the dev release APK (thu lai khi GitHub tra loi loi tam thoi)
+        run: |
+          for attempt in 1 2 3; do
+            if ./gradlew assembleDevRelease; then
+              exit 0
+            fi
+            echo "Build attempt $attempt failed"
+            sleep 30
+          done
+          exit 1
 
       - name: Publish GitHub Release
         env:
