@@ -1,7 +1,8 @@
 name: Automix - chỉnh tay điểm mix từng cặp bài (APK)
 
 # Chạy tay: tab Actions -> chọn workflow này -> Run workflow.
-# Một file duy nhất, KHÔNG commit gì vào repo (trừ khi bật "push_branch").
+# Một file duy nhất, KHÔNG commit gì vào repo (trừ khi bật "push_branch"). Mặc định có đăng APK lên Releases
+# (tạo một tag mới, không đổi mã nguồn); tắt bằng input "publish_release".
 #
 # NỀN: bản APK thật của bạn (all-in-one + dòng trạng thái loop mix + gom cài đặt "Nâng cao").
 # Workflow này gồm đủ cả ba, nên dùng NÓ THAY CHO automix-verdict-line, không chạy chung hai cái.
@@ -15,6 +16,9 @@ name: Automix - chỉnh tay điểm mix từng cặp bài (APK)
 # CHỈNH TAY LÀM GÌ (mở popup bằng nhãn "Mixing" dưới thanh tua hoặc menu "Automix overview"; chỉ sửa được
 # khi đang xem KẾ HOẠCH, tức là trước khi mix bắt đầu):
 #   - Kéo ngang hai waveform: dời cả đoạn mix; thả tay thì làm tròn thành nhịp. Có nhãn +/- giây khi kéo.
+#   - TRÊN THANH TUA: nhấn giữ vào vệt sáng (đoạn mix dự kiến) rồi kéo sang trái/phải, thả tay thì làm tròn thành nhịp
+#     và lưu cho cặp bài đó. Chạm hoặc kéo thường vẫn là tua bài như cũ. Vệt sáng hiện cả khi bài còn "analysing" (lúc đó là đoạn crossfade thường ở cuối bài, và nó nhảy sang vị trí phân tích khi xong).
+#   - Phần chỉnh hiện cả khi bài còn "analysing" (lúc đó chỉnh tính từ kiểu crossfade thường).
 #   - Nút ‹ › dời 1 nhịp, « » dời 1 ô nhịp (bar = 4 nhịp). Dòng "Độ dài" có nút - và + để kéo dài/rút ngắn từng nhịp.
 #     Nếu bài chưa có lưới nhịp tin cậy thì 1 bước = 0,5 giây.
 #   - Chọn kiểu riêng cho cặp này: Tự động / Plain crossfade / Cắt nhanh / Fade dài / Không mix.
@@ -41,6 +45,10 @@ on:
         default: false
       build_apk:
         description: "Build APK dev benchmark (R8 + baseline profile, ký bằng khoá debug)"
+        type: boolean
+        default: true
+      publish_release:
+        description: "Đăng APK lên mục Releases của repo (bản nháp trước-phát-hành), tải thẳng về điện thoại được, không hết hạn như artifact"
         type: boolean
         default: true
       push_branch:
@@ -137,7 +145,7 @@ jobs:
                 * Where on the *playing* track the next transition is planned to happen, as
                 * fractions of its duration, or null when there is nothing worth drawing.
           diff --git a/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt b/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt
-          index 1bdc427..bdc58e1 100644
+          index 1bdc427..a6f1493 100644
           --- a/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt
           +++ b/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt
           @@ -11,6 +11,7 @@ import androidx.media3.common.util.UnstableApi
@@ -186,7 +194,7 @@ jobs:
                    // One line per distinct verdict rather than one per 250ms tick, so the
                    // log says what the planner decided for this pair without burying it.
                    val verdict = "${plan.reason}|${plan.transitionStyle}|fade=${plan.fadeMs}" +
-          @@ -1142,12 +1155,20 @@ class CrossfadeController(
+          @@ -1142,17 +1155,24 @@ class CrossfadeController(
            
                    lastSmartPlan = plan
                    lastSmartPlanStartMs = (plan.transitionStart * 1000).roundToLong()
@@ -211,8 +219,79 @@ jobs:
           +        }
                    if (loop != null && nextStreamReady(nextItem)) {
                        val loopStartMs = (loop.out.loopStart * 1000).roundToLong()
-                       AppSettings.smartTransitionWindow.value = TransitionWindow(
-          @@ -2169,6 +2190,7 @@ class CrossfadeController(
+          -            AppSettings.smartTransitionWindow.value = TransitionWindow(
+          -                start = (loopStartMs.toFloat() / duration).coerceIn(0f, 1f),
+          -                end = 1f,
+          +            AppSettings.smartTransitionWindow.value = markerWindow(
+          +                (loopStartMs.toFloat() / duration).coerceIn(0f, 1f), 1f, plan, duration, currentItem, nextItem, pairOverride,
+                       )
+                       if (markerOnly) return
+                       plannedTransition = currentItem.mediaId to loopStartMs
+          @@ -1170,9 +1190,10 @@ class CrossfadeController(
+                   )?.let { overlap ->
+                       if (nextStreamReady(nextItem)) {
+                           val takeoverMs = (overlap.takeover * 1000).roundToLong()
+          -                AppSettings.smartTransitionWindow.value = TransitionWindow(
+          -                    start = (plan.transitionStart * 1000.0 / duration).toFloat().coerceIn(0f, 1f),
+          -                    end = (plan.transitionEnd * 1000.0 / duration).toFloat().coerceIn(0f, 1f),
+          +                AppSettings.smartTransitionWindow.value = markerWindow(
+          +                    (plan.transitionStart * 1000.0 / duration).toFloat().coerceIn(0f, 1f),
+          +                    (plan.transitionEnd * 1000.0 / duration).toFloat().coerceIn(0f, 1f),
+          +                    plan, duration, currentItem, nextItem, pairOverride,
+                           )
+                           if (markerOnly) return
+                           plannedTransition = currentItem.mediaId to takeoverMs
+          @@ -1192,9 +1213,10 @@ class CrossfadeController(
+                   )?.let { blend ->
+                       if (nextStreamReady(nextItem)) {
+                           val takeoverMs = (blend.takeover * 1000).roundToLong()
+          -                AppSettings.smartTransitionWindow.value = TransitionWindow(
+          -                    start = (plan.transitionStart * 1000.0 / duration).toFloat().coerceIn(0f, 1f),
+          -                    end = (plan.transitionEnd * 1000.0 / duration).toFloat().coerceIn(0f, 1f),
+          +                AppSettings.smartTransitionWindow.value = markerWindow(
+          +                    (plan.transitionStart * 1000.0 / duration).toFloat().coerceIn(0f, 1f),
+          +                    (plan.transitionEnd * 1000.0 / duration).toFloat().coerceIn(0f, 1f),
+          +                    plan, duration, currentItem, nextItem, pairOverride,
+                           )
+                           if (markerOnly) return
+                           plannedTransition = currentItem.mediaId to takeoverMs
+          @@ -1235,8 +1257,10 @@ class CrossfadeController(
+                   val markable = !plan.blocked &&
+                       plan.markerVisible &&
+                       duration > 0L &&
+          -            analysisState.current == TrackAnalysisState.ANALYSED &&
+          -            analysisState.next in MEASURED_ENOUGH_TO_ENTER_ON &&
+          +            // No longer waits for the songs to be analysed: a listener who wants to place the mix by hand
+          +            // cannot do it from a marker that only appears once the analysis has finished, and a song whose
+          +            // analysis never finishes would never get one. Before the analysis lands the window is the plain
+          +            // fade's, at the end of the song, and it moves to the analysed one when it does.
+                       // Last, because it is the only one that can read the cache.
+                       nextStreamReady(nextItem)
+                   val markerVerdict = when {
+          @@ -1244,8 +1268,6 @@ class CrossfadeController(
+                       plan.blocked -> "hidden: plan blocked (${plan.reason})"
+                       !plan.markerVisible -> "hidden: plan has no marker (${plan.reason})"
+                       duration <= 0L -> "hidden: no duration"
+          -            analysisState.current != TrackAnalysisState.ANALYSED -> "hidden: current is ${analysisState.current}"
+          -            analysisState.next !in MEASURED_ENOUGH_TO_ENTER_ON -> "hidden: next is ${analysisState.next}"
+                       else -> "hidden: next stream not ready"
+                   }
+                   if (markerVerdict != lastMarkerVerdict) {
+          @@ -1257,9 +1279,10 @@ class CrossfadeController(
+                       )
+                   }
+                   AppSettings.smartTransitionWindow.value = if (markable) {
+          -            TransitionWindow(
+          -                start = (plan.transitionStart * 1000.0 / duration).toFloat().coerceIn(0f, 1f),
+          -                end = (plan.transitionEnd * 1000.0 / duration).toFloat().coerceIn(0f, 1f),
+          +            markerWindow(
+          +                (plan.transitionStart * 1000.0 / duration).toFloat().coerceIn(0f, 1f),
+          +                (plan.transitionEnd * 1000.0 / duration).toFloat().coerceIn(0f, 1f),
+          +                plan, duration, currentItem, nextItem, pairOverride,
+                       )
+                   } else {
+                       null
+          @@ -2169,6 +2192,7 @@ class CrossfadeController(
                    state: SmartAnalysis,
                    plan: TransitionPlan,
                    advanced: Boolean,
@@ -220,7 +299,7 @@ jobs:
                ) {
                    if (!AppSettings.mixViewOpen.value || AppSettings.smartMixView.value != null) return
                    mixPreviewAt = SystemClock.elapsedRealtime()
-          @@ -2192,7 +2214,8 @@ class CrossfadeController(
+          @@ -2192,7 +2216,8 @@ class CrossfadeController(
                    val ids = currentItem.mediaId to nextItem.mediaId
                    val key = "${ids.first}|${ids.second}|${round(outStart * 20)}|${round(outEnd * 20)}|${round(inStart * 20)}|" +
                        "$beats|$currentAnalysing|$nextAnalysing|${currentAnalysis.bpm}|${nextAnalysis.bpm}|" +
@@ -230,7 +309,7 @@ jobs:
                    if (key == mixPreviewKey && mixPreviewIds == ids && AppSettings.smartMixPreview.value != null) return
                    mixPreviewKey = key
            
-          @@ -2245,11 +2268,30 @@ class CrossfadeController(
+          @@ -2245,11 +2270,55 @@ class CrossfadeController(
                                planned.bassSwap -> planned.swapAtF
                                else -> -1f
                            },
@@ -245,6 +324,31 @@ jobs:
                    )
                }
            
+          +    /**
+          +     * The scrubber's marker for [plan], carrying what dragging it needs: which pair it belongs to, what a
+          +     * step is worth, and where the planned blend itself begins (a loop mix is drawn to the end of the song,
+          +     * so its marker does not start where the blend would).
+          +     */
+          +    private fun markerWindow(
+          +        start: Float,
+          +        end: Float,
+          +        plan: TransitionPlan,
+          +        duration: Long,
+          +        currentItem: MediaItem,
+          +        nextItem: MediaItem,
+          +        pairChoice: TransitionOverride?,
+          +    ) = TransitionWindow(
+          +        start = start,
+          +        end = end,
+          +        pairOut = currentItem.mediaId,
+          +        pairIn = nextItem.mediaId,
+          +        unitSeconds = manualWindowUnit(plan),
+          +        shiftUnits = pairChoice?.startShift ?: 0,
+          +        lengthUnits = pairChoice?.lengthShift ?: 0,
+          +        styleChoice = styleChoiceOf(pairChoice),
+          +        planStart = (plan.transitionStart * 1000.0 / duration).toFloat().coerceIn(0f, 1f),
+          +    )
+          +
           +    /** The popup's number for a pair's style: 0 Automix, 1 crossfade, 2 classic, 3 quick cut, 4 long fade, -1 no mix. */
           +    private fun styleChoiceOf(choice: TransitionOverride?): Int = when {
           +        choice == null -> 0
@@ -261,7 +365,7 @@ jobs:
                /**
                 * Lets the preview go once the popup is closed, a blend has taken over, or
                 * nothing has planned the pair for a while — the queue ran out, a party
-          @@ -2456,6 +2498,13 @@ class CrossfadeController(
+          @@ -2456,6 +2525,13 @@ class CrossfadeController(
            
                /** Why the pair gets no loop mix, for the log and the stats line; null when it does. */
                private var loopRefusal: String? = null
@@ -275,7 +379,7 @@ jobs:
                private var lastLoopVerdict = ""
                private var loopIncomingStarted = false
                private var lastLoopPositionMs = -1L
-          @@ -2488,15 +2537,17 @@ class CrossfadeController(
+          @@ -2488,15 +2564,17 @@ class CrossfadeController(
                }
            
                /** Why [current] -> [next] can't be a loop mix right now, or null when it can. */
@@ -302,7 +406,7 @@ jobs:
                    else -> null
                }
            
-          @@ -2521,8 +2572,8 @@ class CrossfadeController(
+          @@ -2521,8 +2599,8 @@ class CrossfadeController(
                    state: SmartAnalysis,
                ): LoopMix.Plan? {
                    val pair = "${current.mediaId}->${next.mediaId}"
@@ -313,7 +417,7 @@ jobs:
                        return null
                    }
                    askLyrics(current, durationMs)
-          @@ -2530,7 +2581,7 @@ class CrossfadeController(
+          @@ -2530,7 +2608,7 @@ class CrossfadeController(
                    val outLyrics = lyricSpans[current.mediaId]
                    val inLyrics = lyricSpans[next.mediaId]
                    if (outLyrics == null || inLyrics == null) {
@@ -322,7 +426,7 @@ jobs:
                        return null
                    }
                    val reach = AppSettings.loopMixReach.value
-          @@ -2556,12 +2607,27 @@ class CrossfadeController(
+          @@ -2556,12 +2634,27 @@ class CrossfadeController(
                    loopPlanKey = key
                    loopPlanned = plan
                    val lyricsNote = "lyrics ${if (outLyrics.spans != null) "out" else "-"}/${if (inLyrics.spans != null) "in" else "-"}"
@@ -352,7 +456,7 @@ jobs:
                    val verdict = "$pair: " + (plan?.let { "loop mix at ${"%.2f".format(Locale.ROOT, it.out.loopStart)}s · ${describeLoop(it)}" } ?: "no loop mix ($refusal)")
                    if (verdict == lastLoopVerdict) return
                    lastLoopVerdict = verdict
-          @@ -3103,6 +3169,7 @@ class CrossfadeController(
+          @@ -3103,6 +3196,7 @@ class CrossfadeController(
                    loopPlanned = null
                    loopRefusal = reason
                    overlapBlockedPair = overlapActivePair
@@ -360,7 +464,7 @@ jobs:
                    loopBail(reason, settle = false)
                }
            
-          @@ -3131,6 +3198,40 @@ class CrossfadeController(
+          @@ -3131,6 +3225,40 @@ class CrossfadeController(
                        else -> describeAutomix(player, item)
                    }
                    if (AppSettings.automixDetail.value != text) AppSettings.automixDetail.value = text
@@ -401,7 +505,7 @@ jobs:
                }
            
                private fun describeAutomix(player: ExoPlayer, item: MediaItem): String {
-          @@ -4550,6 +4651,9 @@ class CrossfadeController(
+          @@ -4550,6 +4678,9 @@ class CrossfadeController(
            
                    /** The loop mix's setup: how far ahead its loop must start, and when its decks start building. */
                    const val LOOP_SETUP_SECONDS = 15.0
@@ -784,10 +888,39 @@ jobs:
           +    }
           +}
           diff --git a/shared/src/commonMain/kotlin/com/music/bitchord/data/settings/TrackAnalysisState.kt b/shared/src/commonMain/kotlin/com/music/bitchord/data/settings/TrackAnalysisState.kt
-          index e73788d..9f0568e 100644
+          index e73788d..0cbe154 100644
           --- a/shared/src/commonMain/kotlin/com/music/bitchord/data/settings/TrackAnalysisState.kt
           +++ b/shared/src/commonMain/kotlin/com/music/bitchord/data/settings/TrackAnalysisState.kt
-          @@ -123,8 +123,23 @@ class MixTransitionView(
+          @@ -43,7 +43,27 @@ data class SmartAnalysis(
+            * A span of the playing track, in fractions of its duration, that the next transition is planned to
+            * occupy.
+            */
+          -data class TransitionWindow(val start: Float, val end: Float)
+          +data class TransitionWindow(
+          +    val start: Float,
+          +    val end: Float,
+          +    /** The pair's media ids, for saving a window the listener drags; empty when it cannot be moved. */
+          +    val pairOut: String = "",
+          +    val pairIn: String = "",
+          +    /** What one step of a manual move is worth, in seconds; zero when the window cannot be moved. */
+          +    val unitSeconds: Double = 0.0,
+          +    /** How far the listener has already moved the planned blend, and how much longer they made it, in units. */
+          +    val shiftUnits: Int = 0,
+          +    val lengthUnits: Int = 0,
+          +    /** The pair's style: 0 Automix, 1 crossfade, 2 classic, 3 quick cut, 4 long fade, -1 no mix. */
+          +    val styleChoice: Int = 0,
+          +    /**
+          +     * Where the planned blend itself begins, as a fraction. Differs from [start] when a loop mix is
+          +     * drawn instead (it runs to the end of the song), and is what a drag is measured against.
+          +     */
+          +    val planStart: Float = start,
+          +) {
+          +    val movable: Boolean get() = pairOut.isNotEmpty() && pairIn.isNotEmpty() && unitSeconds > 0.0
+          +}
+           
+           /**
+            * An Automix blend in flight, as the scrubber draws it: the beat it is running
+          @@ -123,8 +143,23 @@ class MixTransitionView(
                val fadeIn: FloatArray,
                /** Where in the blend, 0..1, the low end changes hands; negative when it does not. */
                val bassSwapAt: Float = -1f,
@@ -1012,7 +1145,7 @@ jobs:
           +    }
            }
           diff --git a/sharedUi/src/commonMain/composeResources/values-vi/strings.xml b/sharedUi/src/commonMain/composeResources/values-vi/strings.xml
-          index 3d5d40f..c694502 100644
+          index 3d5d40f..72ff8fd 100644
           --- a/sharedUi/src/commonMain/composeResources/values-vi/strings.xml
           +++ b/sharedUi/src/commonMain/composeResources/values-vi/strings.xml
           @@ -9,6 +9,22 @@
@@ -1038,20 +1171,21 @@ jobs:
                <string name="autoplay">Tự động phát (AutoPlay)</string>
                <string name="autoplay_empty_description">Nhạc tương tự sẽ tiếp tục được phát</string>
                <string name="autoplay_off">Tắt tự động phát</string>
-          @@ -219,5 +235,11 @@
+          @@ -219,5 +235,12 @@
                <string name="mix_style_crossfade_desc">Mờ dần 6 giây giữa hai bài, không khớp nhịp. Mục độ dài ở trên không áp dụng.</string>
                <string name="mix_style_classic_desc">Automix nguyên bản: đơn giản hơn, khớp tempo bằng cách tăng hoặc giảm tốc bài kế tiếp.</string>
                <string name="mix_style_quick_cut_desc">Cắt 1 giây khi bài này hết và bài sau vào, như đài phát thanh. Mục độ dài ở trên không áp dụng.</string>
           +    <string name="mix_edit_move">Dời điểm mix</string>
           +    <string name="mix_edit_length">Độ dài</string>
           +    <string name="mix_edit_style">Kiểu cho cặp bài này</string>
-          +    <string name="mix_edit_hint">Kéo ngang hai waveform, hoặc dùng ‹ › để dời 1 nhịp và « » để dời 1 ô nhịp.</string>
+          +    <string name="mix_edit_hint">Kéo ngang hai waveform, hoặc dùng ‹ › để dời 1 nhịp và « » để dời 1 ô nhịp. Cũng có thể nhấn giữ vệt sáng trên thanh tua rồi kéo.</string>
           +    <string name="mix_edit_off">Không mix</string>
           +    <string name="mix_edit_reset">Đặt lại về tự động</string>
+          +    <string name="mix_edit_analysing">Đang phân tích: hiện chỉnh theo kiểu crossfade thường, nên đoạn mix có thể dịch chuyển khi phân tích xong.</string>
                <string name="mix_style_long_fade_desc">Mờ dần 12 giây để hai bài tan vào nhau. Mục độ dài ở trên không áp dụng.</string>
            </resources>
           diff --git a/sharedUi/src/commonMain/composeResources/values/strings.xml b/sharedUi/src/commonMain/composeResources/values/strings.xml
-          index 66a8ed2..32d634e 100644
+          index 66a8ed2..6d1f416 100644
           --- a/sharedUi/src/commonMain/composeResources/values/strings.xml
           +++ b/sharedUi/src/commonMain/composeResources/values/strings.xml
           @@ -9,6 +9,22 @@
@@ -1077,19 +1211,20 @@ jobs:
                <string name="autoplay">AutoPlay</string>
                <string name="autoplay_empty_description">Similar music will keep playing</string>
                <string name="autoplay_off">AutoPlay off</string>
-          @@ -300,4 +316,10 @@
+          @@ -300,4 +316,11 @@
                <string name="mix_style_classic_desc">The original Automix: simpler, and it matches tempo by speeding the next song up or down.</string>
                <string name="mix_style_quick_cut_desc">A 1-second cut as one song ends and the next begins, like radio. The length setting above does not apply.</string>
                <string name="mix_style_long_fade_desc">A 12-second fade so songs melt into each other. The length setting above does not apply.</string>
           +    <string name="mix_edit_move">Move the mix</string>
           +    <string name="mix_edit_length">Length</string>
           +    <string name="mix_edit_style">Style for this pair</string>
-          +    <string name="mix_edit_hint">Drag the decks sideways, or use ‹ › to move one beat and « » to move one bar.</string>
+          +    <string name="mix_edit_hint">Drag the decks sideways, or use ‹ › to move one beat and « » to move one bar. You can also hold the bright stretch on the progress bar and drag it.</string>
           +    <string name="mix_edit_off">No mix</string>
           +    <string name="mix_edit_reset">Reset to Auto</string>
+          +    <string name="mix_edit_analysing">Still analysing: the mix is measured from a plain fade for now, so it may move once analysis finishes.</string>
            </resources>
           diff --git a/sharedUi/src/jvmSharedMain/kotlin/com/music/bitchord/ui/player/MixViewPopup.kt b/sharedUi/src/jvmSharedMain/kotlin/com/music/bitchord/ui/player/MixViewPopup.kt
-          index aba4385..4be8f25 100644
+          index aba4385..9634bfe 100644
           --- a/sharedUi/src/jvmSharedMain/kotlin/com/music/bitchord/ui/player/MixViewPopup.kt
           +++ b/sharedUi/src/jvmSharedMain/kotlin/com/music/bitchord/ui/player/MixViewPopup.kt
           @@ -20,6 +20,7 @@ import androidx.compose.animation.slideOutVertically
@@ -1116,26 +1251,28 @@ jobs:
            import androidx.compose.ui.text.style.TextOverflow
            import androidx.compose.ui.unit.IntOffset
            import androidx.compose.ui.unit.dp
-          @@ -260,6 +263,11 @@ internal fun MixViewContent(view: MixTransitionView, progress: State<Float>, liv
+          @@ -260,6 +263,13 @@ internal fun MixViewContent(view: MixTransitionView, progress: State<Float>, liv
                    MixDecks(view, progress, live, sweep)
                    Spacer(Modifier.height(12.dp))
                    DeckHeader(view.incoming, sweep, Modifier.padding(horizontal = 14.dp))
           +        // Only a plan can be changed: once a blend has started it is the picture of what is playing.
-          +        if (view.editable && !(view.outgoing.analysing || view.incoming.analysing)) {
+          +        // Also while the songs are still being analysed: a hand-placed mix does not need the analysis,
+          +        // and a song that never finishes it is exactly when it is wanted.
+          +        if (view.editable) {
           +            Spacer(Modifier.height(12.dp))
           +            MixEditor(view)
           +        }
                }
            }
            
-          @@ -415,10 +423,42 @@ private fun MixDecks(view: MixTransitionView, progress: State<Float>, live: Bool
+          @@ -415,10 +425,42 @@ private fun MixDecks(view: MixTransitionView, progress: State<Float>, live: Bool
                val outColors = rememberWaveColors(view.outgoing.artworkUrl)
                val inColors = rememberWaveColors(view.incoming.artworkUrl)
                val pending = view.outgoing.analysing || view.incoming.analysing
           +    // Dragging the decks sideways moves the blend: the distance becomes whole beats on release.
           +    var dragUnits by remember { mutableIntStateOf(0) }
           +    val latest = rememberUpdatedState(view)
-          +    val canEdit = view.editable && !pending
+          +    val canEdit = view.editable
                BoxWithConstraints(
                    modifier = Modifier
                        .fillMaxWidth()
@@ -1172,7 +1309,7 @@ jobs:
                ) {
                    val width = maxWidth
                    val panelStart = width * BoxStart
-          @@ -477,6 +517,19 @@ private fun MixDecks(view: MixTransitionView, progress: State<Float>, live: Bool
+          @@ -477,6 +519,19 @@ private fun MixDecks(view: MixTransitionView, progress: State<Float>, live: Bool
                            )
                        }
                    }
@@ -1192,7 +1329,7 @@ jobs:
                }
            }
            
-          @@ -758,6 +811,176 @@ private fun camelotOf(key: String): Camelot? {
+          @@ -758,6 +813,184 @@ private fun camelotOf(key: String): Camelot? {
                return Camelot("$number${if (minor) "A" else "B"}", color)
            }
            
@@ -1262,6 +1399,14 @@ jobs:
           +            fontSize = 11.sp,
           +            lineHeight = 14.sp,
           +        )
+          +        if (view.outgoing.analysing || view.incoming.analysing) {
+          +            Text(
+          +                text = stringResource(Res.string.mix_edit_analysing),
+          +                color = SecondaryText,
+          +                fontSize = 11.sp,
+          +                lineHeight = 14.sp,
+          +            )
+          +        }
           +        Text(
           +            text = stringResource(Res.string.mix_edit_style),
           +            color = SecondaryText,
@@ -1370,18 +1515,41 @@ jobs:
             * Whether the mix popup has been asked for. Set by tapping the "Mixing" label
             * under the scrubber, or "Automix overview" in the player's menu, and cleared
           diff --git a/sharedUi/src/jvmSharedMain/kotlin/com/music/bitchord/ui/player/PlayerControls.kt b/sharedUi/src/jvmSharedMain/kotlin/com/music/bitchord/ui/player/PlayerControls.kt
-          index 15367e3..bad03e9 100644
+          index 15367e3..fe8df74 100644
           --- a/sharedUi/src/jvmSharedMain/kotlin/com/music/bitchord/ui/player/PlayerControls.kt
           +++ b/sharedUi/src/jvmSharedMain/kotlin/com/music/bitchord/ui/player/PlayerControls.kt
-          @@ -121,6 +121,7 @@ import com.music.bitchord.data.NerdStats
+          @@ -120,7 +120,9 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
+           import com.music.bitchord.data.NerdStats
            import com.music.bitchord.data.listentogether.PartyMember
            import com.music.bitchord.data.settings.TrackAnalysisState
+          +import com.music.bitchord.data.settings.TransitionWindow
            import com.music.bitchord.data.settings.AudioQuality
           +import com.music.bitchord.data.settings.AutomixVerdict
            import com.music.bitchord.data.model.Song
            import java.util.Locale
            import java.util.concurrent.TimeUnit
-          @@ -369,7 +370,8 @@ internal fun PlaybackQualityLabel(
+          @@ -226,6 +228,12 @@ internal fun PlayerScrubber(
+               // One clock for the bar and the "Mixing" label, so they breathe on the same beat.
+               val mixPulse = rememberMixPulse({ mixBlend.value }, enabled = !reduceAnimation)
+               val barEffect = rememberBarEffect()
+          +    // What the marker needs to be carried: which pair it belongs to and what a step is worth. Collected by
+          +    // value, but it only changes when the plan does.
+          +    val markerInfo by PlayerSettings.smartTransitionWindow.collectAsStateWithLifecycle()
+          +    val moveMarker: ((Float) -> Unit)? = markerInfo
+          +        ?.takeIf { it.movable && durationMs > 0L && !mixing }
+          +        ?.let { info -> { delta: Float -> commitMarkerMove(info, delta, durationMs) } }
+               Column(Modifier.fillMaxWidth()) {
+                   ThinSlider(
+                       value = shown,
+          @@ -235,6 +243,7 @@ internal fun PlayerScrubber(
+                       mixing = mixing,
+                       mixPulse = mixPulse,
+                       transitionWindow = transitionWindow,
+          +            onWindowMoved = moveMarker,
+                       effect = barEffect,
+                   )
+                   Box(
+          @@ -369,7 +378,8 @@ internal fun PlaybackQualityLabel(
             * Stats for nerds, on the foot of the sleeve: the measured stream, and under
             * it what Automix's analysis is doing. Those lines are nothing at all while the
             * setting is off. The song's BPM and key are the exception: they show whenever
@@ -1391,7 +1559,7 @@ jobs:
             */
            @Composable
            internal fun SleeveNerdStats(song: Song, modifier: Modifier = Modifier) {
-          @@ -405,7 +407,12 @@ internal fun SleeveNerdStats(song: Song, modifier: Modifier = Modifier) {
+          @@ -405,7 +415,12 @@ internal fun SleeveNerdStats(song: Song, modifier: Modifier = Modifier) {
                } else {
                    null
                }
@@ -1405,7 +1573,7 @@ jobs:
                // A plain white line reads fine over the usual dark tile, but a light
                // stretch of an animated cover — sky, snow, a pale sleeve — washes it out
                // entirely. The shadow costs nothing on a dark background and is what
-          @@ -445,6 +452,9 @@ internal fun SleeveNerdStats(song: Song, modifier: Modifier = Modifier) {
+          @@ -445,6 +460,9 @@ internal fun SleeveNerdStats(song: Song, modifier: Modifier = Modifier) {
                            textAlign = TextAlign.Center,
                        )
                    }
@@ -1415,7 +1583,7 @@ jobs:
                    // Only when Automix is actually switched on: otherwise this would
                    // report on analysis nothing is going to use, which is noise rather
                    // than a stat.
-          @@ -485,6 +495,56 @@ internal fun SleeveNerdStats(song: Song, modifier: Modifier = Modifier) {
+          @@ -485,6 +503,56 @@ internal fun SleeveNerdStats(song: Song, modifier: Modifier = Modifier) {
                }
            }
            
@@ -1472,6 +1640,29 @@ jobs:
            /**
             * Previous, play/pause, next.
             *
+          @@ -2027,3 +2095,22 @@ private fun TrackAnalysisState.localizedLabel(): String = when (this) {
+               TrackAnalysisState.WAITING -> stringResource(Res.string.waiting)
+               TrackAnalysisState.FAILED -> stringResource(Res.string.failed)
+           }
+          +
+          +/** The furthest, in units either way, a blend can be moved by hand; the planner's own limit. */
+          +private const val MARKER_MOVE_LIMIT = 96
+          +
+          +/**
+          + * Saves a marker the listener carried along the bar. The blend's start is measured against where the
+          + * planner would put it with no move at all, so a loop mix's marker (which starts where the loop does)
+          + * and a blend's both land where the finger left them, to the nearest beat.
+          + */
+          +private fun commitMarkerMove(info: TransitionWindow, delta: Float, durationMs: Long) {
+          +    val durationSeconds = durationMs / 1000.0
+          +    if (durationSeconds <= 0.0 || info.unitSeconds <= 0.0) return
+          +    val baseStart = info.planStart.toDouble() - info.shiftUnits * info.unitSeconds / durationSeconds
+          +    val wanted = (info.start + delta).toDouble().coerceIn(0.0, 1.0)
+          +    val shift = ((wanted - baseStart) * durationSeconds / info.unitSeconds).roundToInt()
+          +        .coerceIn(-MARKER_MOVE_LIMIT, MARKER_MOVE_LIMIT)
+          +    if (shift == info.shiftUnits) return
+          +    PlayerSettings.setMixPairOverride(info.pairOut, info.pairIn, info.styleChoice, shift, info.lengthUnits)
+          +}
           diff --git a/sharedUi/src/jvmSharedMain/kotlin/com/music/bitchord/ui/player/PlayerHost.kt b/sharedUi/src/jvmSharedMain/kotlin/com/music/bitchord/ui/player/PlayerHost.kt
           index 786bcd7..9c6eb48 100644
           --- a/sharedUi/src/jvmSharedMain/kotlin/com/music/bitchord/ui/player/PlayerHost.kt
@@ -1515,6 +1706,142 @@ jobs:
            }
            
            /** The player's name for the installed host's settings, read where AppSettings used to be. */
+          diff --git a/sharedUi/src/jvmSharedMain/kotlin/com/music/bitchord/ui/player/ThinSlider.kt b/sharedUi/src/jvmSharedMain/kotlin/com/music/bitchord/ui/player/ThinSlider.kt
+          index bd982c8..2c41dd9 100644
+          --- a/sharedUi/src/jvmSharedMain/kotlin/com/music/bitchord/ui/player/ThinSlider.kt
+          +++ b/sharedUi/src/jvmSharedMain/kotlin/com/music/bitchord/ui/player/ThinSlider.kt
+          @@ -93,6 +93,12 @@ fun ThinSlider(
+                * unplayed bar so the mix is visible before it arrives.
+                */
+               transitionWindow: ClosedFloatingPointRange<Float>? = null,
+          +    /**
+          +     * Called when the listener holds the planned transition's stretch of the bar and drags it, with how far it
+          +     * was dragged as a fraction of the track (negative is earlier). Null leaves the stretch a picture, and a
+          +     * touch on it an ordinary seek.
+          +     */
+          +    onWindowMoved: ((Float) -> Unit)? = null,
+               idleHeight: Dp = 7.dp,
+               activeHeight: Dp = 12.dp,
+               activeColor: Color = Color.White.copy(alpha = 0.92f),
+          @@ -103,6 +109,11 @@ fun ThinSlider(
+               effect: BarEffect? = null,
+           ) {
+               var dragging by remember { mutableStateOf(false) }
+          +    // The marker being carried: how far it has been dragged so far, as a fraction of the bar.
+          +    var windowDrag by remember { mutableStateOf(0f) }
+          +    var windowEditing by remember { mutableStateOf(false) }
+          +    val moveCallback by rememberUpdatedState(onWindowMoved)
+          +    val windowNow by rememberUpdatedState(transitionWindow)
+               val height by animateDpAsState(
+                   targetValue = if (dragging) activeHeight else idleHeight,
+                   animationSpec = spring(
+          @@ -161,10 +172,73 @@ fun ThinSlider(
+                       .pointerInput(Unit) {
+                           awaitEachGesture {
+                               val down = awaitFirstDown(requireUnconsumed = false)
+          +                    val mover = moveCallback
+          +                    val window = windowNow
+          +                    var lastPosition = down.position
+          +                    var stillDown = true
+          +                    // A touch that lands on the planned transition's stretch waits to see if it is a hold. A hold
+          +                    // carries the stretch along the bar instead of seeking; anything else (a tap, a drag that
+          +                    // sets off before the hold) is the ordinary seek, started where the finger now is.
+          +                    val onMarker = mover != null && window != null && window.endInclusive > window.start &&
+          +                        down.position.x / size.width in
+          +                        (window.start - MARKER_GRAB_SLOP)..(window.endInclusive + MARKER_GRAB_SLOP)
+          +                    if (onMarker) {
+          +                        val gaveUp: Boolean? = withTimeoutOrNull(viewConfiguration.longPressTimeoutMillis) {
+          +                            var finished = false
+          +                            while (!finished) {
+          +                                val event = awaitPointerEvent()
+          +                                val pointer = event.changes.firstOrNull { it.id == down.id }
+          +                                when {
+          +                                    pointer == null -> {
+          +                                        stillDown = false
+          +                                        finished = true
+          +                                    }
+          +                                    !pointer.pressed -> {
+          +                                        pointer.consume()
+          +                                        lastPosition = pointer.position
+          +                                        stillDown = false
+          +                                        finished = true
+          +                                    }
+          +                                    else -> {
+          +                                        lastPosition = pointer.position
+          +                                        if ((pointer.position - down.position).getDistance() > viewConfiguration.touchSlop) {
+          +                                            finished = true
+          +                                        }
+          +                                    }
+          +                                }
+          +                            }
+          +                            true
+          +                        }
+          +                        if (gaveUp == null) {
+          +                            // Held long enough: the stretch follows the finger until it lifts.
+          +                            windowEditing = true
+          +                            var travelled = 0f
+          +                            var from = lastPosition.x
+          +                            while (true) {
+          +                                val event = awaitPointerEvent()
+          +                                val pointer = event.changes.firstOrNull { it.id == down.id } ?: break
+          +                                if (!pointer.pressed) {
+          +                                    pointer.consume()
+          +                                    break
+          +                                }
+          +                                if (pointer.positionChanged()) {
+          +                                    travelled += pointer.position.x - from
+          +                                    from = pointer.position.x
+          +                                    windowDrag = if (size.width > 0) travelled / size.width else 0f
+          +                                    pointer.consume()
+          +                                }
+          +                            }
+          +                            val moved = windowDrag
+          +                            windowDrag = 0f
+          +                            windowEditing = false
+          +                            if (moved != 0f) mover?.invoke(moved)
+          +                            return@awaitEachGesture
+          +                        }
+          +                    }
+                               dragging = true
+          -                    onValueChange((down.position.x / size.width).coerceIn(0f, 1f))
+          +                    onValueChange((lastPosition.x / size.width).coerceIn(0f, 1f))
+           
+          -                    while (true) {
+          +                    while (stillDown) {
+                                   val event = awaitPointerEvent()
+                                   val pointer = event.changes.firstOrNull { it.id == down.id } ?: break
+                                   if (!pointer.pressed) {
+          @@ -211,15 +285,17 @@ fun ThinSlider(
+                       // It is painted across the bar's own capsule, so its ends dissolve
+                       // into the track instead of sitting on it as a second pill.
+                       shownWindow?.takeIf { windowAlpha > 0f }?.let { window ->
+          -                val from = size.width * window.start.coerceIn(0f, 1f)
+          -                val to = size.width * window.endInclusive.coerceIn(0f, 1f)
+          +                // Carried along with the finger while it is held, but never off either end of the bar.
+          +                val carry = windowDrag.coerceIn(-window.start, 1f - window.endInclusive)
+          +                val from = size.width * (window.start + carry).coerceIn(0f, 1f)
+          +                val to = size.width * (window.endInclusive + carry).coerceIn(0f, 1f)
+                           val span = to - from
+                           if (span > 0f) {
+                               val feather = (span * WINDOW_FEATHER_SHARE)
+                                   .coerceIn(WINDOW_FEATHER_MIN.toPx(), WINDOW_FEATHER_MAX.toPx())
+                                   .coerceAtMost(span / 2f)
+                               val f = feather / span
+          -                    val full = markerColor.alpha * windowAlpha
+          +                    val full = (markerColor.alpha * windowAlpha * (if (windowEditing) 1.8f else 1f)).coerceAtMost(1f)
+                               // Smoothstep down each feather: no slope break where the
+                               // ramp meets the flat middle, so there is no line for the
+                               // eye to catch at either end.
+          @@ -302,6 +378,9 @@ private val WINDOW_FEATHER_MAX = 40.dp
+           /** Gradient stops per feather; enough that the smoothstep has no visible facets. */
+           private const val WINDOW_FEATHER_STEPS = 6
+           
+          +/** How far outside the marker's drawn stretch, as a share of the bar, a touch still grabs it. */
+          +private const val MARKER_GRAB_SLOP = 0.02f
+          +
+           /** How long the Automix window takes to fade in or out. */
+           private const val WINDOW_FADE_MS = 500
+           
           PATCH_EOF
 
       - name: Apply the patches
@@ -1576,12 +1903,66 @@ jobs:
           set -o pipefail
           ./gradlew :shared:jvmTest 2>&1 | tee build.log
 
+      - name: Pre-fetch libusb (GitHub release downloads keep returning 504)
+        run: |
+          # CMake tai libusb 1.0.27 tu trang release cua GitHub luc cau hinh, va trang do dang tra 504.
+          # Thu lan luot: GitHub, SourceForge, kho goi Debian (cung mot file, kiem tra bang ma bam SHA256 ma
+          # CMakeLists da ghim). Het cach thi git clone dung tag v1.0.27 va dong goi lai (khi do bo dong ghim ma bam).
+          D="$HOME/libusb-cache"
+          F="$D/libusb-1.0.27.tar.bz2"
+          SHA="ffaa41d741a8a3bee244ac8e54a72ea05bf2879663c098c82fc5757853441575"
+          GH="https://github.com/libusb/libusb/releases/download/v1.0.27/libusb-1.0.27.tar.bz2"
+          CM=app/src/main/cpp/CMakeLists.txt
+          mkdir -p "$D"
+          OK=0
+          for round in 1 2; do
+            for U in "$GH" \
+                     "https://downloads.sourceforge.net/project/libusb/libusb-1.0/libusb-1.0.27/libusb-1.0.27.tar.bz2" \
+                     "https://deb.debian.org/debian/pool/main/libu/libusb-1.0/libusb-1.0_1.0.27.orig.tar.bz2"; do
+              if curl -fsSL --retry 2 --retry-delay 3 --max-time 120 -o "$F" "$U" \
+                 && echo "$SHA  $F" | sha256sum -c - > /dev/null 2>&1; then
+                echo "Da tai libusb tu: $U"
+                OK=1
+                break 2
+              fi
+              echo "Khong tai duoc (hoac sai ma bam) tu: $U"
+              rm -f "$F"
+            done
+            sleep 15
+          done
+          if [ "$OK" = 1 ]; then
+            sed -i "s#$GH#file://$F#" "$CM"
+          else
+            echo "Ca ba nguon tai deu hong, thu git clone tag v1.0.27"
+            for i in 1 2 3; do
+              rm -rf "$D/libusb-1.0.27"
+              if git clone --depth 1 --branch v1.0.27 https://github.com/libusb/libusb.git "$D/libusb-1.0.27"; then
+                rm -rf "$D/libusb-1.0.27/.git"
+                tar -C "$D" -cjf "$D/libusb-git.tar.bz2" libusb-1.0.27
+                # Ban dong goi lai khong cung ma bam voi ban phat hanh, nen bo dong ghim ma bam.
+                sed -i "s#$GH#file://$D/libusb-git.tar.bz2#; s#URL_HASH SHA256=$SHA)#)#" "$CM"
+                echo "Da dung libusb tu git clone"
+                break
+              fi
+              sleep 20
+            done
+          fi
+          sed -n '/FetchContent_Declare(libusb/,/FetchContent_MakeAvailable(libusb)/p' "$CM"
+
       - name: Build the release-like dev APK
         if: ${{ inputs.build_apk }}
         shell: bash
         run: |
           set -o pipefail
-          ./gradlew assembleDevBenchmark 2>&1 | tee -a build.log
+          # GitHub tra loi 504 tam thoi cho cac lan tai: thu lai toi 3 lan, moi lan cach 30 giay.
+          for attempt in 1 2 3; do
+            if ./gradlew assembleDevBenchmark 2>&1 | tee -a build.log; then
+              exit 0
+            fi
+            echo "Build attempt $attempt failed" | tee -a build.log
+            sleep 30
+          done
+          exit 1
 
       - name: Upload the arm64 APK
         if: ${{ inputs.build_apk }}
@@ -1590,6 +1971,21 @@ jobs:
           name: bitchord-automix-manual-mix-arm64
           path: app/build/outputs/apk/dev/benchmark/*arm64-v8a*.apk
           if-no-files-found: error
+
+      - name: Publish the APK as a GitHub release
+        if: ${{ inputs.build_apk && inputs.publish_release }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          APK="$(ls app/build/outputs/apk/dev/benchmark/*arm64-v8a*.apk | head -n 1)"
+          TAG="automix-manual-mix-run${{ github.run_number }}"
+          gh release create "$TAG" "$APK" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --prerelease \
+            --title "Automix chỉnh tay điểm mix (run ${{ github.run_number }})" \
+            --notes "APK arm64 dựng từ workflow automix-manual-mix. Chỉnh tay điểm mix từng cặp bài: popup Automix overview (menu ba chấm) và nhấn giữ vệt sáng trên thanh tua."
+          echo "Da dang len Releases: $TAG" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload the test reports
         if: ${{ always() && inputs.run_tests }}
