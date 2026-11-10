@@ -343,8 +343,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           SRC="$(ls app/build/outputs/apk/dev/benchmark/*arm64-v8a*.apk | head -n 1)"
-          # App chi nhan file .apk co ten bat dau bang "BitChord-" va tag co dang so phien ban (v1.9.1.N).
-          APK="$RUNNER_TEMP/BitChord-v${APP_VERSION}_arm64-v8a.apk"
+          # App chi nhan file .apk co ten bat dau bang UPDATE_APK_PREFIX (trong app/build.gradle.kts, hien la "Bit-") va tag co dang v1.9.1.N.
+          # Dat sai tien to thi hop thoai cap nhat khong thay APK va nhay sang trang GitHub thay vi cap nhat ngay trong app.
+          PREFIX="$(grep -oP 'UPDATE_APK_PREFIX[^\\]*\\"\K[^\\"]+' app/build.gradle.kts | head -n 1 || true)"
+          PREFIX="${PREFIX:-Bit-}"
+          APK="$RUNNER_TEMP/${PREFIX}v${APP_VERSION}_arm64-v8a.apk"
           cp "$SRC" "$APK"
           TAG="v${APP_VERSION}"
           # Chạy lại workflow (re-run) giữ nguyên run_number nên tag cũ đã tồn tại: xóa bản cũ cùng tag rồi tạo lại.
