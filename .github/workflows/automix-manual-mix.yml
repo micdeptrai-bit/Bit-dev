@@ -16,6 +16,8 @@ name: Automix - chỉnh tay điểm mix từng cặp bài (APK)
 # CHỈNH TAY LÀM GÌ (mở popup bằng nhãn "Mixing" dưới thanh tua hoặc menu "Automix overview"; chỉ sửa được
 # khi đang xem KẾ HOẠCH, tức là trước khi mix bắt đầu):
 #   - Kéo ngang hai waveform: dời cả đoạn mix; thả tay thì làm tròn thành nhịp. Có nhãn +/- giây khi kéo.
+#   - DỊCH LỜI BẰNG GEMINI: Cài đặt, "Dịch lời bằng Gemini", dán mã API (tạo miễn phí ở aistudio.google.com/apikey).
+#     Có mã thì lời bài hát được Gemini dịch theo ngữ cảnh cả bài; lỗi hoặc hết hạn mức thì tự quay về Google Dịch.
 #   - TRÊN THANH TUA: nhấn giữ vào vệt sáng (đoạn mix dự kiến) rồi kéo sang trái/phải, thả tay thì làm tròn thành nhịp
 #     và lưu cho cặp bài đó. Chạm hoặc kéo thường vẫn là tua bài như cũ. Vệt sáng hiện cả khi bài còn "analysing" (lúc đó là đoạn crossfade thường ở cuối bài, và nó nhảy sang vị trí phân tích khi xong).
 #   - Phần chỉnh hiện cả khi bài còn "analysing" (lúc đó chỉnh tính từ kiểu crossfade thường).
@@ -125,11 +127,36 @@ jobs:
       - name: Write the patch
         run: |
           cat > "$RUNNER_TEMP/automix-manual-mix.patch" <<'PATCH_EOF'
+          diff --git a/app/src/main/java/com/music/bitchord/BitChordApplication.kt b/app/src/main/java/com/music/bitchord/BitChordApplication.kt
+          index 2f1ad94..e521d04 100644
+          --- a/app/src/main/java/com/music/bitchord/BitChordApplication.kt
+          +++ b/app/src/main/java/com/music/bitchord/BitChordApplication.kt
+          @@ -100,6 +100,9 @@ class BitChordApplication : Application(), SingletonImageLoader.Factory, Configu
+                   Innertube.appLanguage = { AppCompatDelegate.getApplicationLocales().get(0)?.toLanguageTag() }
+                   migrateScriptOnlyAppLocale()
+                   LyricsTranslation.cacheDir = cacheDir
+          +        LyricsTranslation.gemini = {
+          +            com.music.bitchord.data.lyrics.GeminiSettings(AppSettings.geminiApiKey.value, AppSettings.geminiModel.value)
+          +        }
+                   // PlaybackService shares this process, so seeding the cookie here means
+                   // stream resolution is authenticated from the first play onwards.
+                   authStore = AuthStore(this)
           diff --git a/app/src/main/java/com/music/bitchord/data/settings/AppSettings.kt b/app/src/main/java/com/music/bitchord/data/settings/AppSettings.kt
-          index 91d0ad5..e31204a 100644
+          index 91d0ad5..1c55b7a 100644
           --- a/app/src/main/java/com/music/bitchord/data/settings/AppSettings.kt
           +++ b/app/src/main/java/com/music/bitchord/data/settings/AppSettings.kt
-          @@ -951,6 +951,14 @@ object AppSettings {
+          @@ -562,6 +562,10 @@ object AppSettings {
+                */
+               val translationLanguage = MutableStateFlow("")
+           
+          +    /** Gemini key and model for translating lyrics; a blank key keeps Google Translate. Stored on the device only. */
+          +    val geminiApiKey = MutableStateFlow("")
+          +    val geminiModel = MutableStateFlow("")
+          +
+               /**
+                * Plays a looping video behind the cover art on the player when one is
+                * published for the track — Spotify's Canvas, Apple's motion artwork.
+          @@ -951,6 +955,14 @@ object AppSettings {
                 */
                val automixDetail = MutableStateFlow<String?>(null)
            
@@ -144,6 +171,37 @@ jobs:
                /**
                 * Where on the *playing* track the next transition is planned to happen, as
                 * fractions of its duration, or null when there is nothing worth drawing.
+          @@ -1163,6 +1175,8 @@ object AppSettings {
+                   lyricsOffsetMs.value = prefs.getInt(KEY_LYRICS_OFFSET_MS, 0)
+                       .coerceIn(MIN_LYRICS_OFFSET_MS, MAX_LYRICS_OFFSET_MS)
+                   translationLanguage.value = prefs.getString(KEY_TRANSLATION_LANGUAGE, "").orEmpty()
+          +        geminiApiKey.value = prefs.getString(KEY_GEMINI_API_KEY, "").orEmpty()
+          +        geminiModel.value = prefs.getString(KEY_GEMINI_MODEL, "").orEmpty()
+                   if (highPerformanceMode.value) {
+                       reduceAnimation.value = false
+                       reduceDynamicBlur.value = false
+          @@ -1734,6 +1748,12 @@ object AppSettings {
+                   prefs.edit().putString(KEY_TRANSLATION_LANGUAGE, value).apply()
+               }
+           
+          +    fun setGeminiTranslation(apiKey: String, model: String) {
+          +        geminiApiKey.value = apiKey
+          +        geminiModel.value = model
+          +        prefs.edit().putString(KEY_GEMINI_API_KEY, apiKey).putString(KEY_GEMINI_MODEL, model).apply()
+          +    }
+          +
+               fun setSyncedLyrics(value: Boolean) {
+                   syncedLyrics.value = value
+                   prefs.edit().putBoolean(KEY_SYNCED_LYRICS, value).apply()
+          @@ -2524,6 +2544,8 @@ object AppSettings {
+               private const val KEY_LYRICS_BLUR = "lyrics_blur"
+               private const val KEY_LYRICS_OFFSET_MS = "lyrics_offset_ms"
+               private const val KEY_TRANSLATION_LANGUAGE = "translation_language"
+          +    private const val KEY_GEMINI_API_KEY = "gemini_api_key"
+          +    private const val KEY_GEMINI_MODEL = "gemini_model"
+               private const val KEY_ANIMATED_CANVAS = "animated_canvas"
+               private const val KEY_CANVAS_OVER_CELLULAR = "canvas_over_cellular"
+               private const val KEY_SPOTIFY_CANVAS_AUTO_HIDE = "spotify_canvas_auto_hide"
           diff --git a/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt b/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt
           index 1bdc427..a6f1493 100644
           --- a/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt
@@ -598,10 +656,19 @@ jobs:
            
                override fun cachedCanvas(song: Song): CanvasArtwork? = CanvasRepository.cached(song)
           diff --git a/app/src/main/java/com/music/bitchord/ui/screens/SettingsSheet.kt b/app/src/main/java/com/music/bitchord/ui/screens/SettingsSheet.kt
-          index 70c4ea1..0c8301a 100644
+          index 70c4ea1..44e9ee8 100644
           --- a/app/src/main/java/com/music/bitchord/ui/screens/SettingsSheet.kt
           +++ b/app/src/main/java/com/music/bitchord/ui/screens/SettingsSheet.kt
-          @@ -317,6 +317,9 @@ fun SettingsScreen(
+          @@ -276,6 +276,8 @@ fun SettingsScreen(
+               val syncedLyrics by AppSettings.syncedLyrics.collectAsStateWithLifecycle()
+               val lyricsSources by AppSettings.lyricsSources.collectAsStateWithLifecycle()
+               val translationLanguage by AppSettings.translationLanguage.collectAsStateWithLifecycle()
+          +    val geminiApiKey by AppSettings.geminiApiKey.collectAsStateWithLifecycle()
+          +    val geminiModel by AppSettings.geminiModel.collectAsStateWithLifecycle()
+               val theme by AppSettings.themeMode.collectAsStateWithLifecycle()
+               val appFont by AppSettings.appFont.collectAsStateWithLifecycle()
+               val sessionId by AppSettings.audioSessionId.collectAsStateWithLifecycle()
+          @@ -317,6 +319,9 @@ fun SettingsScreen(
                var pickingAutomixGesture by remember { mutableStateOf(false) }
                var pickingLoopReach by remember { mutableStateOf(false) }
                var pickingMixProfile by remember { mutableStateOf(false) }
@@ -611,7 +678,15 @@ jobs:
                var pickingVisualEffect by remember { mutableStateOf(false) }
                val localMusicFolderUri by AppSettings.localMusicFolderUri.collectAsStateWithLifecycle()
                val highPerformanceMode by AppSettings.highPerformanceMode.collectAsStateWithLifecycle()
-          @@ -843,6 +846,19 @@ fun SettingsScreen(
+          @@ -425,6 +430,7 @@ fun SettingsScreen(
+                   }
+               }
+               var showListenBrainzTokenDialog by remember { mutableStateOf(false) }
+          +    var showGeminiDialog by remember { mutableStateOf(false) }
+               var showLastfmLoginDialog by remember { mutableStateOf(false) }
+               val scrobbleScope = rememberCoroutineScope()
+           
+          @@ -843,6 +849,19 @@ fun SettingsScreen(
                                )
                            }
                        }
@@ -631,7 +706,7 @@ jobs:
                        val automixPerformanceTitle = stringResource(R.string.automix_performance)
                        row(automixPerformanceTitle, "cpu", "battery") {
                            BypassedByBitPerfect(bitPerfectReady) {
-          @@ -855,83 +871,88 @@ fun SettingsScreen(
+          @@ -855,83 +874,88 @@ fun SettingsScreen(
                                )
                            }
                        }
@@ -790,8 +865,93 @@ jobs:
                        }
                        val skipSilenceTitle = stringResource(R.string.skip_silence)
                        row(skipSilenceTitle, "silence") {
+          @@ -1463,6 +1487,20 @@ fun SettingsScreen(
+                                   onClick = onTranslationLanguage,
+                               )
+                           }
+          +                val geminiTitle = stringResource(R.string.gemini_translation)
+          +                row(geminiTitle, "gemini", "ai", "translate", "lyrics", "api key") {
+          +                    SettingsRow(
+          +                        icon = SfIcons.Translate,
+          +                        title = geminiTitle,
+          +                        subtitle = if (geminiApiKey.isBlank()) {
+          +                            stringResource(R.string.gemini_translation_off)
+          +                        } else {
+          +                            stringResource(R.string.gemini_translation_on, geminiModel.ifBlank { stringResource(R.string.gemini_model_default) })
+          +                        },
+          +                        trailing = { Chevron() },
+          +                        onClick = { showGeminiDialog = true },
+          +                    )
+          +                }
+                       }
+                   }
+           
+          @@ -2169,6 +2207,63 @@ fun SettingsScreen(
+                   )
+               }
+           
+          +    if (showGeminiDialog) {
+          +        var keyInput by remember { mutableStateOf(geminiApiKey) }
+          +        var modelInput by remember { mutableStateOf(geminiModel) }
+          +        AlertDialog(
+          +            onDismissRequest = { showGeminiDialog = false },
+          +            title = { Text(stringResource(R.string.gemini_translation)) },
+          +            text = {
+          +                Column {
+          +                    Text(
+          +                        text = stringResource(R.string.gemini_translation_hint),
+          +                        style = MaterialTheme.typography.bodySmall,
+          +                        modifier = Modifier.padding(bottom = 12.dp),
+          +                    )
+          +                    OutlinedTextField(
+          +                        value = keyInput,
+          +                        onValueChange = { keyInput = it },
+          +                        label = { Text(stringResource(R.string.gemini_api_key)) },
+          +                        singleLine = true,
+          +                        modifier = Modifier.fillMaxWidth(),
+          +                    )
+          +                    Spacer(Modifier.height(8.dp))
+          +                    OutlinedTextField(
+          +                        value = modelInput,
+          +                        onValueChange = { modelInput = it },
+          +                        label = { Text(stringResource(R.string.gemini_model)) },
+          +                        placeholder = { Text(stringResource(R.string.gemini_model_default)) },
+          +                        singleLine = true,
+          +                        modifier = Modifier.fillMaxWidth(),
+          +                    )
+          +                }
+          +            },
+          +            confirmButton = {
+          +                TextButton(onClick = {
+          +                    AppSettings.setGeminiTranslation(keyInput.trim(), modelInput.trim())
+          +                    showGeminiDialog = false
+          +                }) {
+          +                    Text(stringResource(R.string.save))
+          +                }
+          +            },
+          +            dismissButton = {
+          +                Row {
+          +                    if (geminiApiKey.isNotBlank()) {
+          +                        TextButton(onClick = {
+          +                            AppSettings.setGeminiTranslation("", "")
+          +                            showGeminiDialog = false
+          +                        }) {
+          +                            Text(stringResource(R.string.gemini_remove_key))
+          +                        }
+          +                    }
+          +                    TextButton(onClick = { showGeminiDialog = false }) {
+          +                        Text(stringResource(R.string.cancel))
+          +                    }
+          +                }
+          +            },
+          +        )
+          +    }
+          +
+               if (showListenBrainzTokenDialog) {
+                   var tokenInput by remember { mutableStateOf(listenBrainzToken) }
+                   AlertDialog(
           diff --git a/app/src/main/res/values-vi/strings.xml b/app/src/main/res/values-vi/strings.xml
-          index 4accbb8..8f8e227 100644
+          index 4accbb8..c495821 100644
           --- a/app/src/main/res/values-vi/strings.xml
           +++ b/app/src/main/res/values-vi/strings.xml
           @@ -1463,6 +1463,10 @@
@@ -805,8 +965,21 @@ jobs:
            
                <!-- Player visual effect -->
                <string name="visual_effect">Hiệu ứng thanh tua và âm lượng</string>
+          @@ -1476,4 +1480,12 @@
+               <string name="visual_effect_bars_subtitle">Các cột equalizer mọc lên từ thanh, cao hơn ở chỗ nhạc to</string>
+               <string name="visual_effect_wave">Sóng</string>
+               <string name="visual_effect_wave_subtitle">Phổ âm thanh thành một làn sóng mượt mọc lên từ thanh</string>
+          +    <string name="gemini_translation">Dịch lời bằng Gemini</string>
+          +    <string name="gemini_translation_off">Đang tắt. Dùng Google Dịch</string>
+          +    <string name="gemini_translation_on">Đang bật (%1$s)</string>
+          +    <string name="gemini_api_key">Mã API Gemini</string>
+          +    <string name="gemini_model">Model</string>
+          +    <string name="gemini_model_default">gemini-flash-latest</string>
+          +    <string name="gemini_remove_key">Xóa mã</string>
+          +    <string name="gemini_translation_hint">Tạo mã miễn phí tại aistudio.google.com/apikey rồi dán vào đây. Lời bài hát được gửi tới Gemini API của Google, mã chỉ lưu trên máy này. Để trống thì dùng Google Dịch. Nếu Gemini không trả lời được thì app tự dùng Google Dịch.</string>
+           </resources>
           diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
-          index 552310f..9d40021 100644
+          index 552310f..edf21c2 100644
           --- a/app/src/main/res/values/strings.xml
           +++ b/app/src/main/res/values/strings.xml
           @@ -1421,6 +1421,10 @@
@@ -820,6 +993,43 @@ jobs:
            
                <!-- Player visual effect -->
                <string name="visual_effect">Seek and volume bar effect</string>
+          @@ -1434,4 +1438,12 @@
+               <string name="visual_effect_bars_subtitle">Equaliser bars rising from the bars, taller where the music is louder</string>
+               <string name="visual_effect_wave">Wave</string>
+               <string name="visual_effect_wave_subtitle">The spectrum as one smooth wave rising from the bars</string>
+          +    <string name="gemini_translation">Translate lyrics with Gemini</string>
+          +    <string name="gemini_translation_off">Off. Uses Google Translate</string>
+          +    <string name="gemini_translation_on">On (%1$s)</string>
+          +    <string name="gemini_api_key">Gemini API key</string>
+          +    <string name="gemini_model">Model</string>
+          +    <string name="gemini_model_default">gemini-flash-latest</string>
+          +    <string name="gemini_remove_key">Remove key</string>
+          +    <string name="gemini_translation_hint">Create a free key at aistudio.google.com/apikey and paste it here. Lyrics are sent to Google\u2019s Gemini API and the key stays on this device. Leave it empty to use Google Translate. If Gemini cannot answer, Google Translate is used instead.</string>
+           </resources>
+          diff --git a/docs/LYRICS_TRANSLATION.md b/docs/LYRICS_TRANSLATION.md
+          index 62ed145..01c93f0 100644
+          --- a/docs/LYRICS_TRANSLATION.md
+          +++ b/docs/LYRICS_TRANSLATION.md
+          @@ -113,6 +113,19 @@ A typical cached song occupies only a few kilobytes. Clearing the application's
+           cache removes all persisted translations without affecting downloaded music or
+           settings.
+           
+          +## Optional: translate with Gemini
+          +
+          +Settings, **Translate lyrics with Gemini**, takes a Gemini API key (a free one comes from
+          +aistudio.google.com/apikey) and an optional model id (default `gemini-flash-latest`). With a key set,
+          +`LyricsTranslation` sends the whole lyric to Gemini's `generateContent` endpoint as one JSON array of lines
+          +(split in order only for very long lyrics) and asks for a JSON object with the same number of translated
+          +lines plus the source language. The answer is checked line for line exactly like a Google batch; if the
+          +request fails or the reply does not match, Google Translate answers instead.
+          +
+          +Gemini's results are cached under their own key (target language plus model), so enabling it never serves a
+          +translation Google cached earlier. The key is stored in the app's preferences on the device. Lyrics are
+          +sent to Google's Gemini API, and the call has a 45-second deadline instead of 12 seconds.
+          +
+           ## Failure behaviour
+           
+           - Network failure: a localized message is shown and the original stays visible.
           diff --git a/shared/src/commonMain/kotlin/com/music/bitchord/data/settings/AutomixVerdict.kt b/shared/src/commonMain/kotlin/com/music/bitchord/data/settings/AutomixVerdict.kt
           new file mode 100644
           index 0000000..bbd21e4
@@ -1144,6 +1354,256 @@ jobs:
           +        assertFalse(TransitionOverride(lengthShift = -1).isDefault)
           +    }
            }
+          diff --git a/shared/src/jvmSharedMain/kotlin/com/music/bitchord/data/lyrics/LyricsTranslation.kt b/shared/src/jvmSharedMain/kotlin/com/music/bitchord/data/lyrics/LyricsTranslation.kt
+          index 9b68c17..1344e96 100644
+          --- a/shared/src/jvmSharedMain/kotlin/com/music/bitchord/data/lyrics/LyricsTranslation.kt
+          +++ b/shared/src/jvmSharedMain/kotlin/com/music/bitchord/data/lyrics/LyricsTranslation.kt
+          @@ -23,12 +23,22 @@ import kotlinx.coroutines.Dispatchers
+           import kotlinx.serialization.Serializable
+           import kotlinx.serialization.encodeToString
+           import kotlinx.serialization.json.Json
+          +import kotlinx.serialization.json.JsonPrimitive
+          +import kotlinx.serialization.json.addJsonObject
+          +import kotlinx.serialization.json.buildJsonArray
+          +import kotlinx.serialization.json.buildJsonObject
+           import kotlinx.serialization.json.contentOrNull
+          +import kotlinx.serialization.json.jsonObject
+          +import kotlinx.serialization.json.put
+          +import kotlinx.serialization.json.putJsonArray
+          +import kotlinx.serialization.json.putJsonObject
+           import kotlinx.serialization.json.jsonArray
+           import kotlinx.serialization.json.jsonPrimitive
+           import okhttp3.Call
+           import okhttp3.Callback
+           import okhttp3.FormBody
+          +import okhttp3.MediaType.Companion.toMediaType
+          +import okhttp3.RequestBody.Companion.toRequestBody
+           import okhttp3.Request
+           import okhttp3.Response
+           import java.io.IOException
+          @@ -42,6 +52,12 @@ import java.io.IOException
+            * is kept in a bounded cache under [Context.getCacheDir], so Android may reclaim
+            * it and the feature can never grow without limit.
+            */
+          +/**
+          + * What the listener set to have Gemini translate their lyrics. Without a key
+          + * ([apiKey] blank) translation goes to Google Translate exactly as before.
+          + */
+          +data class GeminiSettings(val apiKey: String, val model: String)
+          +
+           object LyricsTranslation {
+               sealed interface Result {
+                   data class Translated(
+          @@ -75,6 +91,10 @@ object LyricsTranslation {
+               private const val MAX_CACHE_BYTES = 2L * 1024L * 1024L
+               private const val MAX_BATCH_CHARS = 3_500
+               private const val MAX_PARALLEL_REQUESTS = 2
+          +    private const val GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/"
+          +    private const val GEMINI_DEFAULT_MODEL = "gemini-flash-latest"
+          +    // A whole song in one request almost always; only an unusually long lyric is split, in order.
+          +    private const val GEMINI_MAX_CHARS = 7_000
+               // Input Tools changes ASCII digits to the destination script, so match the
+               // private-use wrapper rather than assuming the counter remains ASCII.
+               private val markerRegex = Regex("\\uE000[^\\uE001]*\\uE001")
+          @@ -98,6 +118,22 @@ object LyricsTranslation {
+                */
+               @Volatile
+               var cacheDir: File? = null
+          +
+          +    /**
+          +     * The Gemini key and model the listener set, read each time a song is translated so a change
+          +     * takes effect without a restart. Null, or a blank key, leaves Google Translate in charge.
+          +     */
+          +    @Volatile
+          +    var gemini: () -> GeminiSettings? = { null }
+          +
+          +    // Gemini thinks before it answers and a long lyric is a long answer, so it gets far longer than the
+          +    // twelve seconds Google's endpoint needs.
+          +    private val geminiClient by lazy {
+          +        Http.client.newBuilder()
+          +            .callTimeout(45, TimeUnit.SECONDS)
+          +            .connectTimeout(8, TimeUnit.SECONDS)
+          +            .build()
+          +    }
+               private val client by lazy {
+                   Http.client.newBuilder()
+                       .callTimeout(12, TimeUnit.SECONDS)
+          @@ -146,7 +182,11 @@ object LyricsTranslation {
+           
+                   val slots = flatten(lines)
+                   if (slots.isEmpty()) return Result.Unavailable
+          -        val cacheKey = cacheKey(trackId, target, slots)
+          +        val ai = gemini()?.takeIf { it.apiKey.isNotBlank() }
+          +        // Google's and Gemini's wording of the same song are kept apart, so turning Gemini on is not hidden
+          +        // behind a translation Google already cached.
+          +        val googleKey = cacheKey(trackId, target, slots)
+          +        val cacheKey = if (ai == null) googleKey else cacheKey(trackId, "$target|gemini:${geminiModel(ai)}", slots)
+                   val cached = memory.get(cacheKey) ?: readCache(cacheKey)?.also {
+                       memory.put(cacheKey, it)
+                   }
+          @@ -162,6 +202,29 @@ object LyricsTranslation {
+                       }
+                   }
+           
+          +        if (ai != null) {
+          +            val answer = translateWithGemini(slots, target, ai)
+          +            if (answer != null) {
+          +                val entry = CachedTranslation(
+          +                    sourceLanguage = answer.sourceLanguage,
+          +                    targetLanguage = target,
+          +                    texts = answer.texts,
+          +                )
+          +                memory.put(cacheKey, entry)
+          +                writeCache(cacheKey, entry)
+          +                return if (sameLanguage(entry.sourceLanguage, target)) {
+          +                    Result.SameLanguage(entry.sourceLanguage)
+          +                } else {
+          +                    Result.Translated(
+          +                        lines = rebuild(lines, slots, entry.texts),
+          +                        sourceLanguage = entry.sourceLanguage,
+          +                        fromCache = false,
+          +                    )
+          +                }
+          +            }
+          +            // Gemini could not answer (no network, quota, a malformed reply): Google Translate still can.
+          +        }
+          +
+                   val batches = batches(slots)
+                   val answers = coroutineScope {
+                       // Two short requests at a time keeps a long lyric fast without
+          @@ -209,8 +272,8 @@ object LyricsTranslation {
+                       targetLanguage = target,
+                       texts = translated,
+                   )
+          -        memory.put(cacheKey, entry)
+          -        writeCache(cacheKey, entry)
+          +        memory.put(googleKey, entry)
+          +        writeCache(googleKey, entry)
+           
+                   return if (sameLanguage(source, target)) {
+                       Result.SameLanguage(source)
+          @@ -286,6 +349,121 @@ object LyricsTranslation {
+                   )
+               }
+           
+          +    private class GeminiAnswer(val texts: List<String>, val sourceLanguage: String)
+          +
+          +    /** The model to call: what the listener typed if it is a plausible id, else the default. */
+          +    private fun geminiModel(settings: GeminiSettings): String =
+          +        settings.model.trim().takeIf { id ->
+          +            id.isNotEmpty() && id.all { it.isLetterOrDigit() || it == '.' || it == '-' || it == '_' }
+          +        } ?: GEMINI_DEFAULT_MODEL
+          +
+          +    /**
+          +     * The whole lyric through Gemini, in as few requests as fit. Null when any of them fails, so the caller
+          +     * can fall back to Google Translate rather than show half a song.
+          +     */
+          +    private suspend fun translateWithGemini(
+          +        slots: List<TextSlot>,
+          +        target: String,
+          +        settings: GeminiSettings,
+          +    ): GeminiAnswer? {
+          +        val chunks = mutableListOf<List<TextSlot>>()
+          +        var current = mutableListOf<TextSlot>()
+          +        var length = 0
+          +        slots.forEach { slot ->
+          +            if (current.isNotEmpty() && length + slot.text.length > GEMINI_MAX_CHARS) {
+          +                chunks += current
+          +                current = mutableListOf()
+          +                length = 0
+          +            }
+          +            current += slot
+          +            length += slot.text.length
+          +        }
+          +        if (current.isNotEmpty()) chunks += current
+          +
+          +        val texts = mutableListOf<String>()
+          +        val sources = mutableListOf<Pair<String, Int>>()
+          +        for (chunk in chunks) {
+          +            val answer = requestGemini(chunk, target, settings) ?: return null
+          +            texts += answer.texts
+          +            sources += answer.sourceLanguage to chunk.sumOf { it.text.length }
+          +        }
+          +        if (texts.size != slots.size) return null
+          +        val source = sources
+          +            .groupBy { canonicalLanguage(it.first) }
+          +            .maxByOrNull { (_, values) -> values.sumOf { it.second } }
+          +            ?.key
+          +            .orEmpty()
+          +        if (source.isBlank()) return null
+          +        return GeminiAnswer(texts, source)
+          +    }
+          +
+          +    private suspend fun requestGemini(
+          +        slots: List<TextSlot>,
+          +        target: String,
+          +        settings: GeminiSettings,
+          +    ): GeminiAnswer? {
+          +        val lines = buildJsonArray { slots.forEach { add(JsonPrimitive(it.text)) } }
+          +        val instruction = "You translate song lyrics. The user sends a JSON array of lyric lines. " +
+          +            "Translate every line into the language with BCP-47 tag \"$target\". " +
+          +            "Translate by meaning and tone, not word for word: keep idioms, slang, imagery and the singer's " +
+          +            "voice natural in the target language, and keep names as they are. " +
+          +            "Return exactly one translated string for every input line, in the same order. Never merge, split, " +
+          +            "drop or add lines. A line already in the target language is returned unchanged. " +
+          +            "Set \"source\" to the ISO 639-1 code of the language the lyrics are mainly sung in."
+          +        val body = buildJsonObject {
+          +            putJsonObject("systemInstruction") {
+          +                putJsonArray("parts") { addJsonObject { put("text", instruction) } }
+          +            }
+          +            putJsonArray("contents") {
+          +                addJsonObject {
+          +                    put("role", "user")
+          +                    putJsonArray("parts") { addJsonObject { put("text", lines.toString()) } }
+          +                }
+          +            }
+          +            putJsonObject("generationConfig") {
+          +                put("temperature", 0.3)
+          +                put("responseMimeType", "application/json")
+          +                putJsonObject("responseSchema") {
+          +                    put("type", "OBJECT")
+          +                    putJsonObject("properties") {
+          +                        putJsonObject("source") { put("type", "STRING") }
+          +                        putJsonObject("lines") {
+          +                            put("type", "ARRAY")
+          +                            putJsonObject("items") { put("type", "STRING") }
+          +                        }
+          +                    }
+          +                    putJsonArray("required") {
+          +                        add(JsonPrimitive("source"))
+          +                        add(JsonPrimitive("lines"))
+          +                    }
+          +                }
+          +            }
+          +        }
+          +        val request = Request.Builder()
+          +            .url("$GEMINI_ENDPOINT${geminiModel(settings)}:generateContent")
+          +            .header("x-goog-api-key", settings.apiKey.trim())
+          +            .header("User-Agent", "BitChord/1.7.1")
+          +            .post(body.toString().toRequestBody("application/json".toMediaType()))
+          +            .build()
+          +        val response = try {
+          +            geminiClient.newCall(request).awaitBody()
+          +        } catch (cancelled: CancellationException) {
+          +            throw cancelled
+          +        } catch (_: IOException) {
+          +            return null
+          +        }
+          +        return runCatching {
+          +            val root = json.parseToJsonElement(response).jsonObject
+          +            val text = root["candidates"]!!.jsonArray[0].jsonObject["content"]!!.jsonObject["parts"]!!.jsonArray
+          +                .joinToString("") { it.jsonObject["text"]?.jsonPrimitive?.contentOrNull.orEmpty() }
+          +            val answer = json.parseToJsonElement(text).jsonObject
+          +            val translated = answer["lines"]!!.jsonArray.map { it.jsonPrimitive.content.trim() }
+          +            val source = answer["source"]?.jsonPrimitive?.contentOrNull.orEmpty()
+          +            if (translated.size != slots.size || translated.any { it.isBlank() }) return@runCatching null
+          +            GeminiAnswer(translated, source)
+          +        }.getOrNull()
+          +    }
+          +
+               private fun flatten(lines: List<LyricLine>): List<TextSlot> = buildList {
+                   lines.forEachIndexed { index, line ->
+                       if (line.text.isNotBlank()) {
           diff --git a/sharedUi/src/commonMain/composeResources/values-vi/strings.xml b/sharedUi/src/commonMain/composeResources/values-vi/strings.xml
           index 3d5d40f..72ff8fd 100644
           --- a/sharedUi/src/commonMain/composeResources/values-vi/strings.xml
