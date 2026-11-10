@@ -1,0 +1,373 @@
+name: Gemini dịch lời sang tiếng Việt - prompt dịch giả (APK)
+
+# Chạy tay: tab Actions -> chọn workflow này -> Run workflow.
+# Một file duy nhất, KHÔNG commit gì vào repo. Mặc định có đăng APK lên Releases (tạo một tag mới, không đổi mã nguồn).
+#
+# LÀM GÌ:
+#   0. Dựng lại nền: chạy các bước của "automix-manual-mix (3).yml" (nó tự dựng all-in-one rồi áp patch có sẵn
+#      tính năng "Dịch lời bằng Gemini"). Bỏ qua nếu LyricsTranslation.kt trong repo đã có Gemini.
+#   1. Vá requestGemini() trong LyricsTranslation.kt:
+#      - Khi dịch sang TIẾNG VIỆT: system instruction = prompt dịch giả/lyricist (đoạn bạn đưa) + một đoạn ngắn
+#        mô tả định dạng JSON mà app cần. Các ngôn ngữ đích khác vẫn dùng prompt tiếng Anh cũ.
+#      - safetySettings: HARASSMENT, HATE_SPEECH, SEXUALLY_EXPLICIT, DANGEROUS_CONTENT đều BLOCK_NONE.
+#      - temperature 0.3 -> 0.7.
+#   2. Build APK arm64 và đăng lên Releases.
+#
+# SAU KHI CÀI APK: Cài đặt, "Dịch lời bằng Gemini", dán mã API (tạo miễn phí ở aistudio.google.com/apikey).
+# Gemini lỗi, hết hạn mức hoặc trả sai số dòng thì app tự quay về Google Dịch.
+#
+# CẦN CÓ trong .github/workflows: "automix-manual-mix (3).yml" và "automix-all-in-one (2).yml" (đúng tên, hoặc đổi ở input).
+# Nếu patch không áp được, workflow dừng và báo rõ bước nào lệch.
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_file:
+        description: "Workflow chứa phần Gemini cần dựng lại (trong .github/workflows)"
+        type: string
+        default: "automix-manual-mix (3).yml"
+      chain_file:
+        description: "Workflow all-in-one mà base_file cần (trong .github/workflows)"
+        type: string
+        default: "automix-all-in-one (2).yml"
+      skip_base:
+        description: "Bỏ qua bước dựng lại nền (chỉ bật khi repo đã chứa sẵn phần Gemini)"
+        type: boolean
+        default: false
+      run_tests:
+        description: "Chạy test của module shared trước khi build"
+        type: boolean
+        default: false
+      build_apk:
+        description: "Build APK dev benchmark (R8 + baseline profile, ký bằng khoá debug)"
+        type: boolean
+        default: true
+      publish_release:
+        description: "Đăng APK lên mục Releases của repo, tải thẳng về điện thoại được"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: gemini-vi-lyrics-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gemini-vi:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Rebuild the base (all-in-one + Gemini translation)
+        if: ${{ !inputs.skip_base }}
+        shell: bash
+        env:
+          BASE_FILE: ${{ inputs.base_file }}
+          CHAIN_FILE: ${{ inputs.chain_file }}
+        run: |
+          set -euo pipefail
+          LT=shared/src/jvmSharedMain/kotlin/com/music/bitchord/data/lyrics/LyricsTranslation.kt
+          if grep -q "GEMINI_ENDPOINT" "$LT"; then
+            echo "Repo đã có Gemini trong LyricsTranslation.kt, bỏ qua bước dựng lại."
+            exit 0
+          fi
+          cat > "$RUNNER_TEMP/replay_base.py" <<'REPLAY_EOF'
+          import os, re, subprocess, sys
+
+          try:
+              import yaml
+          except ImportError:
+              subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "--break-system-packages", "pyyaml"])
+              import yaml
+
+          name = os.environ["BASE_FILE"]
+          chain = os.environ["CHAIN_FILE"]
+          path = os.path.join(".github", "workflows", name)
+          if not os.path.isfile(path):
+              sys.exit(f"::error::Không thấy .github/workflows/{name}. Workflow này cần file đó để có sẵn phần Gemini (hoặc nhập đúng tên ở input base_file).")
+
+          doc = yaml.safe_load(open(path, encoding="utf8"))
+          steps = next(iter(doc["jobs"].values()))["steps"]
+          first = next((i for i, s in enumerate(steps) if s.get("name") == "Rebuild the all-in-one features"), None)
+          last = next((i for i, s in enumerate(steps) if s.get("name") == "Commit the patch locally"), None)
+          if first is None or last is None or last <= first:
+              sys.exit(f"::error::{name} không có cấu trúc như mong đợi (bước 'Rebuild the all-in-one features' ... 'Commit the patch locally'). Gửi lại file đó để mình chỉnh.")
+
+          EXPR = "$" + "{{"
+          CHAIN_RE = re.compile(r"\$\{\{\s*inputs\.chain_file\s*\}\}")
+          OTHER_RE = re.compile(r"\$\{\{\s*inputs\.\w+(\s*&&\s*inputs\.\w+)*\s*\}\}")
+
+          todo = [s for s in steps[first:last] if s.get("run")]
+          print(f"Dựng lại {len(todo)} bước từ {name}")
+          for s in todo:
+              run = CHAIN_RE.sub(lambda m: chain, s["run"])
+              run = OTHER_RE.sub("true", run)
+              if EXPR in run:
+                  sys.exit(f"::error::Bước '{s.get('name')}' còn biểu thức GitHub chưa xử lý được.")
+              env = dict(os.environ)
+              for k, v in (s.get("env") or {}).items():
+                  env[k] = CHAIN_RE.sub(lambda m: chain, str(v))
+              print(f"::group::{s.get('name')}", flush=True)
+              r = subprocess.run(["bash", "-eo", "pipefail", "-c", run], env=env)
+              print("::endgroup::", flush=True)
+              if r.returncode != 0:
+                  sys.exit(f"::error::Bước '{s.get('name')}' của {name} lỗi (mã {r.returncode}).")
+          print("Đã dựng xong bản nền (all-in-one + Gemini).")
+
+          REPLAY_EOF
+          python3 "$RUNNER_TEMP/replay_base.py"
+
+      - name: Apply the Vietnamese lyricist prompt to Gemini
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/vi_prompt.py" <<'VI_EOF'
+          import re, sys
+
+          PATH = "shared/src/jvmSharedMain/kotlin/com/music/bitchord/data/lyrics/LyricsTranslation.kt"
+          src = open(PATH, encoding="utf8").read()
+
+          if "GEMINI_VI_INSTRUCTION" in src:
+              print("Prompt tiếng Việt đã có sẵn, bỏ qua.")
+              sys.exit(0)
+          if "GEMINI_ENDPOINT" not in src or "requestGemini" not in src:
+              sys.exit("::error::LyricsTranslation.kt chưa có phần Gemini (patch automix-manual-mix chưa được áp).")
+
+          def once(text, old, new, what):
+              if text.count(old) != 1:
+                  sys.exit(f"::error::Không vá được '{what}': tìm thấy {text.count(old)} chỗ khớp (cần đúng 1). Gửi lại LyricsTranslation.kt để mình chỉnh.")
+              return text.replace(old, new)
+
+          CONSTS = '''    private const val GEMINI_MAX_CHARS = 7_000
+
+              // Lời dịch giả/lyricist tiếng Việt: dùng khi ngôn ngữ đích là tiếng Việt. Phần sau là hợp đồng JSON mà app cần
+              // (mỗi dòng gốc một dòng dịch, kèm mã ngôn ngữ nguồn), không đổi ý của các nguyên tắc trên.
+              private val GEMINI_VI_INSTRUCTION = """
+                  Bạn là một dịch giả âm nhạc và người viết lời bài hát (lyricist) chuyên nghiệp. Khi dịch lời bài hát sang tiếng Việt, hãy tuân thủ tuyệt đối các nguyên tắc sau:
+
+                  - Đọc hiểu toàn bài trước khi dịch: Nắm bắt câu chuyện tổng thể, mạch cảm xúc và xác định rõ ai đang hát cho ai. Giữ nhất quán cặp đại từ xưng hô, thì (tương lai, quá khứ, hiện tại) và giọng điệu xuyên suốt cả bài.
+                  - Xưng hô và văn phong phong phú: Chọn cách xưng hô tự nhiên, đa dạng theo đúng chất nhạc và mối quan hệ trong bài (anh - em, tôi - em, tao - mày, ta - người...). Dịch sát nghĩa nhưng tuyệt đối không dịch word-by-word gây ngượng ép.
+                  - Chuẩn chất lời bài hát: Câu từ phải ngắn gọn, cô đọng, có nhịp điệu và giàu cảm xúc.
+                  - Tiếng lóng & Nghĩa đôi: Toàn bộ tiếng lóng (slang), từ đường phố, từ chửi thề và câu chữ nghĩa đôi (double entendre) phải được dịch bằng tiếng lóng tiếng Việt tự nhiên có cùng mức độ và sắc thái. Không làm nhẹ từ, không nói giảm nói tránh, không kiểm duyệt.
+                  - Tên riêng & Thương hiệu: Giữ nguyên 100% tên riêng và tên thương hiệu như bản gốc.
+                  - Đầu ra: Chỉ trả về lời bài hát đã dịch, không thêm bất kỳ lời giải thích hay mở đầu nào.
+              """.trimIndent() + "\\n\\n" + """
+                  Định dạng bắt buộc của ứng dụng: người dùng gửi một mảng JSON, mỗi phần tử là một dòng lời bài hát. Hãy trả về một đối tượng JSON gồm "lines" và "source". "lines" là mảng các chuỗi đã dịch: đúng một chuỗi cho mỗi dòng đầu vào, cùng thứ tự, tuyệt đối không gộp, tách, bỏ hay thêm dòng, không để dòng nào trống. "source" là mã ISO 639-1 của ngôn ngữ mà bài hát chủ yếu được hát (bỏ qua các dòng ngoại ngữ xen vào). Các dòng hoặc cụm ngôn ngữ khác xen vào bài cũng phải được dịch theo đúng các nguyên tắc trên; chỉ giữ nguyên tiếng đệm thuần túy (oh, yeah, la la la) và những dòng vốn đã là tiếng Việt. Các nguyên tắc trên áp dụng cho nội dung từng chuỗi trong "lines"; không thêm lời giải thích hay mở đầu vào chuỗi nào.
+              """.trimIndent()
+          '''
+
+          src = once(src, "    private const val GEMINI_MAX_CHARS = 7_000\n", CONSTS, "hằng GEMINI_MAX_CHARS")
+
+          # Prompt tiếng Anh cũ vẫn dùng cho các ngôn ngữ đích khác.
+          src = once(src, 'val instruction = "You translate song lyrics.', 'val englishInstruction = "You translate song lyrics.', "prompt tiếng Anh")
+
+          m = re.search(r'^([ \t]*)\+?[^\n]*ignoring the mixed-in foreign lines\."\n', src, re.M)
+          if not m or len(re.findall(r'ignoring the mixed-in foreign lines\."\n', src)) != 1:
+              sys.exit("::error::Không tìm thấy cuối prompt tiếng Anh trong requestGemini.")
+          base_ind = re.search(r'^([ \t]*)val englishInstruction', src, re.M).group(1)
+          pick = base_ind + 'val instruction = if (target.startsWith("vi", ignoreCase = true)) GEMINI_VI_INSTRUCTION else englishInstruction\n'
+          src = src[:m.end()] + pick + src[m.end():]
+
+          # temperature 0.7
+          src = once(src, 'put("temperature", 0.3)', 'put("temperature", 0.7)', "temperature")
+
+          # safetySettings: tắt hết bộ lọc để từ lóng, chửi thề, nghĩa đôi không bị chặn.
+          gm = re.findall(r'^([ \t]*)putJsonObject\("generationConfig"\) \{\n', src, re.M)
+          if len(gm) != 1:
+              sys.exit(f"::error::Không vá được 'generationConfig': tìm thấy {len(gm)} chỗ (cần đúng 1).")
+          i = gm[0]
+          SAFETY = (
+              f'{i}putJsonArray("safetySettings") {{\n'
+              f'{i}    // Lời bài hát đầy tiếng lóng, chửi thề và nghĩa đôi: không để bộ lọc của Gemini chặn.\n'
+              f'{i}    listOf(\n'
+              f'{i}        "HARM_CATEGORY_HARASSMENT",\n'
+              f'{i}        "HARM_CATEGORY_HATE_SPEECH",\n'
+              f'{i}        "HARM_CATEGORY_SEXUALLY_EXPLICIT",\n'
+              f'{i}        "HARM_CATEGORY_DANGEROUS_CONTENT",\n'
+              f'{i}    ).forEach {{ category ->\n'
+              f'{i}        addJsonObject {{\n'
+              f'{i}            put("category", category)\n'
+              f'{i}            put("threshold", "BLOCK_NONE")\n'
+              f'{i}        }}\n'
+              f'{i}    }}\n'
+              f'{i}}}\n'
+          )
+          anchor = f'{i}putJsonObject("generationConfig") {{\n'
+          src = once(src, anchor, SAFETY + anchor, "generationConfig")
+
+          open(PATH, "w", encoding="utf8").write(src)
+          print("Đã vá LyricsTranslation.kt: prompt dịch giả tiếng Việt, safetySettings BLOCK_NONE, temperature 0.7.")
+
+          VI_EOF
+          python3 "$RUNNER_TEMP/vi_prompt.py"
+          {
+            echo "## Gemini dịch lời: prompt dịch giả tiếng Việt"
+            echo
+            echo "safetySettings = BLOCK_NONE (4 mục), temperature = 0.7"
+            echo
+            git status --short | sed 's/^/    /'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Write local.properties
+        run: |
+          echo "LASTFM_API_KEY=" > local.properties
+          echo "LASTFM_SECRET=" >> local.properties
+          echo "LISTEN_TOGETHER_SERVER=" >> local.properties
+
+      - run: chmod +x gradlew
+
+      - name: Shared tests
+        if: ${{ inputs.run_tests }}
+        shell: bash
+        run: |
+          set -o pipefail
+          ./gradlew :shared:jvmTest 2>&1 | tee build.log
+
+      - name: Pre-fetch libusb (GitHub release downloads keep returning 504)
+        run: |
+          # CMake tai libusb 1.0.27 tu trang release cua GitHub luc cau hinh, va trang do dang tra 504.
+          # Thu lan luot: GitHub, SourceForge, kho goi Debian (cung mot file, kiem tra bang ma bam SHA256 ma
+          # CMakeLists da ghim). Het cach thi git clone dung tag v1.0.27 va dong goi lai (khi do bo dong ghim ma bam).
+          D="$HOME/libusb-cache"
+          F="$D/libusb-1.0.27.tar.bz2"
+          SHA="ffaa41d741a8a3bee244ac8e54a72ea05bf2879663c098c82fc5757853441575"
+          GH="https://github.com/libusb/libusb/releases/download/v1.0.27/libusb-1.0.27.tar.bz2"
+          CM=app/src/main/cpp/CMakeLists.txt
+          mkdir -p "$D"
+          OK=0
+          for round in 1 2; do
+            for U in "$GH" \
+                     "https://downloads.sourceforge.net/project/libusb/libusb-1.0/libusb-1.0.27/libusb-1.0.27.tar.bz2" \
+                     "https://deb.debian.org/debian/pool/main/libu/libusb-1.0/libusb-1.0_1.0.27.orig.tar.bz2"; do
+              if curl -fsSL --retry 2 --retry-delay 3 --max-time 120 -o "$F" "$U" \
+                 && echo "$SHA  $F" | sha256sum -c - > /dev/null 2>&1; then
+                echo "Da tai libusb tu: $U"
+                OK=1
+                break 2
+              fi
+              echo "Khong tai duoc (hoac sai ma bam) tu: $U"
+              rm -f "$F"
+            done
+            sleep 15
+          done
+          if [ "$OK" = 1 ]; then
+            sed -i "s#$GH#file://$F#" "$CM"
+          else
+            echo "Ca ba nguon tai deu hong, thu git clone tag v1.0.27"
+            for i in 1 2 3; do
+              rm -rf "$D/libusb-1.0.27"
+              if git clone --depth 1 --branch v1.0.27 https://github.com/libusb/libusb.git "$D/libusb-1.0.27"; then
+                rm -rf "$D/libusb-1.0.27/.git"
+                tar -C "$D" -cjf "$D/libusb-git.tar.bz2" libusb-1.0.27
+                # Ban dong goi lai khong cung ma bam voi ban phat hanh, nen bo dong ghim ma bam.
+                sed -i "s#$GH#file://$D/libusb-git.tar.bz2#; s#URL_HASH SHA256=$SHA)#)#" "$CM"
+                echo "Da dung libusb tu git clone"
+                break
+              fi
+              sleep 20
+            done
+          fi
+          sed -n '/FetchContent_Declare(libusb/,/FetchContent_MakeAvailable(libusb)/p' "$CM"
+
+      - name: Keep the same debug signing key between runs
+        if: ${{ inputs.build_apk }}
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: debug-keystore-v1-${{ github.repository }}
+
+      - name: Make the in-app updater follow this repo's releases
+        if: ${{ inputs.build_apk }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          CHECKER=app/src/main/java/com/music/bitchord/data/AppUpdateChecker.kt
+          BASE="$(grep -oP 'bitchordVersionName"\] = "\K[0-9]+(\.[0-9]+)*' build.gradle.kts)"
+          CODE="$(grep -oP 'bitchordVersionCode"\] = \K[0-9]+' build.gradle.kts)"
+          # Workflow khác có thể đã phát hành số cao hơn run_number của workflow này; lấy số lớn hơn tag mới nhất
+          # để Android luôn coi bản này là bản mới hơn và cài đè được.
+          LAST="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name 2>/dev/null | grep -oE '[0-9]+$' || true)"
+          N="$GITHUB_RUN_NUMBER"
+          if [ -n "$LAST" ] && [ "$LAST" -ge "$N" ]; then N=$((LAST + 1)); fi
+          VER="${BASE}.${N}"
+          # 1) Hoi release moi nhat cua CHINH repo nay thay vi repo goc.
+          sed -i "s#repos/[A-Za-z0-9_.-]*/[A-Za-z0-9_.-]*/releases/latest#repos/${GITHUB_REPOSITORY}/releases/latest#" "$CHECKER"
+          grep -q "repos/${GITHUB_REPOSITORY}/releases/latest" "$CHECKER"
+          # 2) Moi lan chay tang so phien ban (1.9.1.N) de app thay ban moi hon ban dang cai.
+          sed -i "s#\(bitchordVersionName\"\] = \"\)[^\"]*#\1${VER}#; s#\(bitchordVersionCode\"\] = \)[0-9]*#\1$((CODE + N))#" build.gradle.kts
+          grep -q "bitchordVersionName\"\] = \"${VER}\"" build.gradle.kts
+          echo "APP_VERSION=${VER}" >> "$GITHUB_ENV"
+          echo "Phien ban app: ${VER}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build the release-like dev APK
+        if: ${{ inputs.build_apk }}
+        shell: bash
+        run: |
+          set -o pipefail
+          # GitHub tra loi 504 tam thoi cho cac lan tai: thu lai toi 3 lan, moi lan cach 30 giay.
+          for attempt in 1 2 3; do
+            if ./gradlew assembleDevBenchmark 2>&1 | tee -a build.log; then
+              exit 0
+            fi
+            echo "Build attempt $attempt failed" | tee -a build.log
+            sleep 30
+          done
+          exit 1
+
+      - name: Upload the arm64 APK
+        if: ${{ inputs.build_apk }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: bitchord-gemini-vi-arm64
+          path: app/build/outputs/apk/dev/benchmark/*arm64-v8a*.apk
+          if-no-files-found: error
+
+      - name: Publish the APK as a GitHub release
+        if: ${{ inputs.build_apk && inputs.publish_release }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          SRC="$(ls app/build/outputs/apk/dev/benchmark/*arm64-v8a*.apk | head -n 1)"
+          # App chi nhan file .apk co ten bat dau bang "BitChord-" va tag co dang so phien ban (v1.9.1.N).
+          APK="$RUNNER_TEMP/BitChord-v${APP_VERSION}_arm64-v8a.apk"
+          cp "$SRC" "$APK"
+          TAG="v${APP_VERSION}"
+          # Chạy lại workflow (re-run) giữ nguyên run_number nên tag cũ đã tồn tại: xóa bản cũ cùng tag rồi tạo lại.
+          gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes 2>/dev/null || true
+          gh release create "$TAG" "$APK" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --latest \
+            --title "Gemini dịch lời tiếng Việt (bản ${APP_VERSION})" \
+            --notes "APK arm64 dựng từ workflow gemini-vi-lyrics: dịch lời bằng Gemini với prompt dịch giả tiếng Việt (BLOCK_NONE, temperature 0.7). Cài đặt, Dịch lời bằng Gemini, dán mã API."
+          echo "Da dang len Releases: $TAG" >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload the test reports
+        if: ${{ always() && inputs.run_tests }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: shared-test-reports
+          path: shared/build/reports/tests/
+          if-no-files-found: ignore
+
+      - name: Upload the build log
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
