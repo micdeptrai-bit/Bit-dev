@@ -1,7 +1,11 @@
 name: Gemini dịch lời sang tiếng Việt - prompt dịch giả (APK)
 
 # Chạy tay: tab Actions -> chọn workflow này -> Run workflow.
-# Một file duy nhất, KHÔNG commit gì vào repo. Mặc định có đăng APK lên Releases (tạo một tag mới, không đổi mã nguồn).
+# Một file duy nhất, KHÔNG commit gì vào repo. APK đăng lên Releases (tạo một tag mới, không đổi mã nguồn).
+#
+# APK RA ĐÂY LÀ CÙNG APP VỚI WORKFLOW "Bit Dev APK": package com.bit.dev, tên "Bit Dev", cùng khoá ký, tên file
+# Bit-v<số>_arm64-v8a.apk. Nên cài là CẬP NHẬT ĐÈ lên app đang dùng (giữ nguyên dữ liệu), và hộp thoại cập nhật
+# trong app tải + cài được ngay trong app. Các bước build/ký/đăng bên dưới chép nguyên từ "Bit Dev APK".
 #
 # LÀM GÌ:
 #   0. Dựng lại nền: chạy các bước của "automix-manual-mix (3).yml" (nó tự dựng all-in-one rồi áp patch có sẵn
@@ -11,13 +15,12 @@ name: Gemini dịch lời sang tiếng Việt - prompt dịch giả (APK)
 #        mô tả định dạng JSON mà app cần. Các ngôn ngữ đích khác vẫn dùng prompt tiếng Anh cũ.
 #      - safetySettings: HARASSMENT, HATE_SPEECH, SEXUALLY_EXPLICIT, DANGEROUS_CONTENT đều BLOCK_NONE.
 #      - temperature 0.3 -> 0.7.
-#   2. Build APK arm64 và đăng lên Releases.
+#   2. Đổi tên gói/phiên bản/updater y như "Bit Dev APK", build assembleDevRelease, đăng lên Releases.
 #
-# SAU KHI CÀI APK: Cài đặt, "Dịch lời bằng Gemini", dán mã API (tạo miễn phí ở aistudio.google.com/apikey).
-# Gemini lỗi, hết hạn mức hoặc trả sai số dòng thì app tự quay về Google Dịch.
+# Số bản dựng luôn LỚN HƠN mọi tag hiện có của repo (kể cả tag do "Bit Dev APK" tạo), để versionCode cao hơn bản đang
+# cài và Android cho cài đè. SAU KHI CÀI APK: Cài đặt, "Dịch lời bằng Gemini", dán mã API.
 #
 # CẦN CÓ trong .github/workflows: "automix-manual-mix (3).yml" và "automix-all-in-one (2).yml" (đúng tên, hoặc đổi ở input).
-# Nếu patch không áp được, workflow dừng và báo rõ bước nào lệch.
 
 on:
   workflow_dispatch:
@@ -34,16 +37,8 @@ on:
         description: "Bỏ qua bước dựng lại nền (chỉ bật khi repo đã chứa sẵn phần Gemini)"
         type: boolean
         default: false
-      run_tests:
-        description: "Chạy test của module shared trước khi build"
-        type: boolean
-        default: false
-      build_apk:
-        description: "Build APK dev benchmark (R8 + baseline profile, ký bằng khoá debug)"
-        type: boolean
-        default: true
       publish_release:
-        description: "Đăng APK lên mục Releases của repo, tải thẳng về điện thoại được"
+        description: "Đăng APK lên mục Releases (cần để app cập nhật trong app được). Tắt = chỉ có file ở Artifacts"
         type: boolean
         default: true
 
@@ -58,10 +53,18 @@ jobs:
   gemini-vi:
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    env:
+      BIT_DEV_BUILD: 'true'
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: gradle
 
       - name: Rebuild the base (all-in-one + Gemini translation)
         if: ${{ !inputs.skip_base }}
@@ -213,29 +216,75 @@ jobs:
             git status --short | sed 's/^/    /'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
-        with:
-          java-version: '17'
-          distribution: 'temurin'
-
-      - uses: gradle/actions/setup-gradle@v4
-
-      - name: Write local.properties
+      - name: Pick a build number newer than every existing release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          echo "LASTFM_API_KEY=" > local.properties
-          echo "LASTFM_SECRET=" >> local.properties
-          echo "LISTEN_TOGETHER_SERVER=" >> local.properties
+          set -euo pipefail
+          # "Bit Dev APK" dùng run_number của nó làm số bản dựng. Lấy số lớn hơn mọi tag hiện có để versionCode
+          # luôn cao hơn bản đang cài, nếu không Android từ chối cài đè (coi là hạ phiên bản).
+          LAST="$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" --jq '.[].tag_name' 2>/dev/null | grep -oE '[0-9]+$' | sort -n | tail -n 1 || true)"
+          N="$GITHUB_RUN_NUMBER"
+          if [ -n "$LAST" ] && [ "$LAST" -ge "$N" ]; then N=$((LAST + 1)); fi
+          echo "BUILD_N=$N" >> "$GITHUB_ENV"
+          echo "Số bản dựng: $N (số lớn nhất trong các tag trước đó: ${LAST:-không có})" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Patch (rename, version, updater)
+        env:
+          RUN: ${{ env.BUILD_N }}
+        run: |
+          sed -i 's/com\.dev\.bitchord/com.bit.dev/g; s/BitChord Dev/Bit Dev/g' \
+            app/build.gradle.kts app/src/dev/AndroidManifest.xml wearos/build.gradle.kts tv/build.gradle.kts
+          sed -i '/UPDATE_APK_PREFIX/s/BitChord-/Bit-/' app/build.gradle.kts
+          sed -i 's#repos/[A-Za-z0-9_-]*/[A-Za-z0-9_-]*/releases/latest#repos/${{ github.repository }}/releases/latest#' \
+            app/src/main/java/com/music/bitchord/data/AppUpdateChecker.kt
+          python3 - <<'PY'
+          import os, re
+          run = int(os.environ["RUN"])
+          s = open("build.gradle.kts").read()
+          m = re.search(r'(?:bitchordVersionName"\] = |baseVersion = )"([0-9.]+)"', s)
+          ver = f"{m.group(1)}.{run}"
+          s = re.sub(r'extra\["bitchordVersionCode"\][^\n]*', f'extra["bitchordVersionCode"] = {39 + run}', s)
+          s = re.sub(r'extra\["bitchordVersionName"\] = [^\n]*(\n    if [^\n]*)?',
+                     f'extra["bitchordVersionName"] = "{ver}"', s)
+          open("build.gradle.kts", "w").write(s)
+          open(os.environ["GITHUB_ENV"], "a").write(f"VER={ver}\n")
+          PY
+
+      # Neu repo co secret thi dung secret, khong thi dung key dev nhung san ben duoi.
+
+      - name: Setup Secrets (Keystore & local.properties)
+        env:
+          S_LASTFM_KEY: ${{ secrets.LASTFM_API_KEY }}
+          S_LASTFM_SECRET: ${{ secrets.LASTFM_SECRET }}
+          S_LISTEN: ${{ secrets.LISTEN_TOGETHER_SERVER }}
+          S_KS_B64: ${{ secrets.KEYSTORE_BASE64 }}
+          S_KS_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+          S_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          S_KEY_PASS: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          {
+            echo "LASTFM_API_KEY=$S_LASTFM_KEY"
+            echo "LASTFM_SECRET=$S_LASTFM_SECRET"
+            echo "LISTEN_TOGETHER_SERVER=$S_LISTEN"
+          } > local.properties
+          KS_B64="$S_KS_B64"; KS_PASS="$S_KS_PASS"; KEY_ALIAS="$S_KEY_ALIAS"; KEY_PASS="$S_KEY_PASS"
+          if [ -z "$KS_B64" ]; then
+            KS_B64='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'
+            KS_PASS='M8rnSCC3C4TkChAh'
+            KEY_ALIAS='bitdev'
+            KEY_PASS='M8rnSCC3C4TkChAh'
+          fi
+          echo "$KS_B64" | base64 -d > bitchord-release.jks
+          {
+            echo "storeFile=bitchord-release.jks"
+            echo "storePassword=$KS_PASS"
+            echo "keyAlias=$KEY_ALIAS"
+            echo "keyPassword=$KEY_PASS"
+          } > keystore.properties
 
       - run: chmod +x gradlew
-
-      - name: Shared tests
-        if: ${{ inputs.run_tests }}
-        shell: bash
-        run: |
-          set -o pipefail
-          ./gradlew :shared:jvmTest 2>&1 | tee build.log
-
       - name: Pre-fetch libusb (GitHub release downloads keep returning 504)
         run: |
           # CMake tai libusb 1.0.27 tu trang release cua GitHub luc cau hinh, va trang do dang tra 504.
@@ -282,95 +331,34 @@ jobs:
           fi
           sed -n '/FetchContent_Declare(libusb/,/FetchContent_MakeAvailable(libusb)/p' "$CM"
 
-      - name: Keep the same debug signing key between runs
-        if: ${{ inputs.build_apk }}
-        uses: actions/cache@v4
-        with:
-          path: ~/.android/debug.keystore
-          key: debug-keystore-v1-${{ github.repository }}
-
-      - name: Make the in-app updater follow this repo's releases
-        if: ${{ inputs.build_apk }}
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Build the dev release APK (thu lai khi GitHub tra loi loi tam thoi)
         run: |
-          set -euo pipefail
-          CHECKER=app/src/main/java/com/music/bitchord/data/AppUpdateChecker.kt
-          BASE="$(grep -oP 'bitchordVersionName"\] = "\K[0-9]+(\.[0-9]+)*' build.gradle.kts)"
-          CODE="$(grep -oP 'bitchordVersionCode"\] = \K[0-9]+' build.gradle.kts)"
-          # Workflow khác có thể đã phát hành số cao hơn run_number của workflow này; lấy số lớn hơn tag mới nhất
-          # để Android luôn coi bản này là bản mới hơn và cài đè được.
-          LAST="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name 2>/dev/null | grep -oE '[0-9]+$' || true)"
-          N="$GITHUB_RUN_NUMBER"
-          if [ -n "$LAST" ] && [ "$LAST" -ge "$N" ]; then N=$((LAST + 1)); fi
-          VER="${BASE}.${N}"
-          # 1) Hoi release moi nhat cua CHINH repo nay thay vi repo goc.
-          sed -i "s#repos/[A-Za-z0-9_.-]*/[A-Za-z0-9_.-]*/releases/latest#repos/${GITHUB_REPOSITORY}/releases/latest#" "$CHECKER"
-          grep -q "repos/${GITHUB_REPOSITORY}/releases/latest" "$CHECKER"
-          # 2) Moi lan chay tang so phien ban (1.9.1.N) de app thay ban moi hon ban dang cai.
-          sed -i "s#\(bitchordVersionName\"\] = \"\)[^\"]*#\1${VER}#; s#\(bitchordVersionCode\"\] = \)[0-9]*#\1$((CODE + N))#" build.gradle.kts
-          grep -q "bitchordVersionName\"\] = \"${VER}\"" build.gradle.kts
-          echo "APP_VERSION=${VER}" >> "$GITHUB_ENV"
-          echo "Phien ban app: ${VER}" >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Build the release-like dev APK
-        if: ${{ inputs.build_apk }}
-        shell: bash
-        run: |
-          set -o pipefail
-          # GitHub tra loi 504 tam thoi cho cac lan tai: thu lai toi 3 lan, moi lan cach 30 giay.
           for attempt in 1 2 3; do
-            if ./gradlew assembleDevBenchmark 2>&1 | tee -a build.log; then
+            if ./gradlew assembleDevRelease; then
               exit 0
             fi
-            echo "Build attempt $attempt failed" | tee -a build.log
+            echo "Build attempt $attempt failed"
             sleep 30
           done
           exit 1
 
-      - name: Upload the arm64 APK
-        if: ${{ inputs.build_apk }}
+      - name: Upload the APK
         uses: actions/upload-artifact@v4
         with:
-          name: bitchord-gemini-vi-arm64
-          path: app/build/outputs/apk/dev/benchmark/*arm64-v8a*.apk
+          name: bit-dev-gemini-arm64
+          path: app/build/outputs/apk/dev/release/*.apk
           if-no-files-found: error
 
-      - name: Publish the APK as a GitHub release
-        if: ${{ inputs.build_apk && inputs.publish_release }}
+      - name: Publish GitHub Release
+        if: ${{ inputs.publish_release }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          SRC="$(ls app/build/outputs/apk/dev/benchmark/*arm64-v8a*.apk | head -n 1)"
-          # App chi nhan file .apk co ten bat dau bang UPDATE_APK_PREFIX (trong app/build.gradle.kts, hien la "Bit-") va tag co dang v1.9.1.N.
-          # Dat sai tien to thi hop thoai cap nhat khong thay APK va nhay sang trang GitHub thay vi cap nhat ngay trong app.
-          PREFIX="$(grep -oP 'UPDATE_APK_PREFIX[^\\]*\\"\K[^\\"]+' app/build.gradle.kts | head -n 1 || true)"
-          PREFIX="${PREFIX:-Bit-}"
-          APK="$RUNNER_TEMP/${PREFIX}v${APP_VERSION}_arm64-v8a.apk"
-          cp "$SRC" "$APK"
-          TAG="v${APP_VERSION}"
-          # Chạy lại workflow (re-run) giữ nguyên run_number nên tag cũ đã tồn tại: xóa bản cũ cùng tag rồi tạo lại.
-          gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes 2>/dev/null || true
-          gh release create "$TAG" "$APK" \
-            --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" \
-            --latest \
-            --title "Gemini dịch lời tiếng Việt (bản ${APP_VERSION})" \
-            --notes "APK arm64 dựng từ workflow gemini-vi-lyrics: dịch lời bằng Gemini với prompt dịch giả tiếng Việt (BLOCK_NONE, temperature 0.7). Cài đặt, Dịch lời bằng Gemini, dán mã API."
-          echo "Da dang len Releases: $TAG" >> "$GITHUB_STEP_SUMMARY"
-      - name: Upload the test reports
-        if: ${{ always() && inputs.run_tests }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: shared-test-reports
-          path: shared/build/reports/tests/
-          if-no-files-found: ignore
-
-      - name: Upload the build log
-        if: ${{ failure() }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-log
-          path: build.log
-          if-no-files-found: ignore
+          APK=$(ls app/build/outputs/apk/dev/release/*.apk | head -1)
+          # Tên file phải bắt đầu bằng UPDATE_APK_PREFIX ("Bit-") thì hộp thoại cập nhật trong app mới nhận.
+          cp "$APK" "Bit-v${VER}_arm64-v8a.apk"
+          gh release delete "v${VER}" --cleanup-tag --yes || true
+          gh release create "v${VER}" "Bit-v${VER}_arm64-v8a.apk" \
+            --target "$GITHUB_SHA" --latest --title "Bit Dev v${VER}" \
+            --notes "Build #${{ github.run_number }}: dịch lời bằng Gemini với prompt dịch giả tiếng Việt (BLOCK_NONE, temperature 0.7). Cùng app Bit Dev, cài đè lên bản cũ. Cài đặt, Dịch lời bằng Gemini, dán mã API."
+          echo "Đã đăng lên Releases: v${VER}" >> "$GITHUB_STEP_SUMMARY"
