@@ -10,16 +10,20 @@ name: "Automix - chỉnh tay điểm mix + không đổi tốc độ + tách gi�
 # BẢN GỘP: file này thay cho cả automix-khong-tua-nhanh.yml và automix-tach-giong.yml (xoá hai file đó đi,
 # không chạy chung). Hai patch đó đã được dựng lại để áp chồng được lên chuỗi all-in-one + manual-mix.
 #   - Công tắc "no_speedup": Automix không bao giờ đổi tốc độ nhạc (cặp lệch BPM rơi về crossfade thường).
-#   - Công tắc "stem_separation": thêm khả năng tách giọng / nhạc nền bằng model open-unmix có sẵn (mới chỉ
-#     thêm khả năng tách, chưa có transition nào dùng nó).
-#   Thứ tự áp: chuỗi all-in-one -> manual-mix -> no_speedup -> stem_separation. Patch nào không áp được thì
+#   - Công tắc "stem_separation": thêm khả năng tách giọng / nhạc nền bằng model open-unmix có sẵn.
+#   - Công tắc "stem_mix" (cần stem_separation): nối khả năng tách đó vào Automix. Ở mọi blend dài từ 4 giây,
+#     giọng bài cũ ra trước, nhạc nền hai bài hòa vào nhau, giọng bài mới vào sau, nên hai giọng không đè lên nhau.
+#     Bộ trộn native tự bỏ giọng khỏi từng bài theo thời gian (patch viết cho bộ trộn có sẵn, đã có test chạy
+#     trên máy). Không tách được (lỗi, bài quá dài) thì blend đó chạy như cũ.
+#   Thứ tự áp: chuỗi all-in-one -> manual-mix -> no_speedup -> stem_separation -> stem_mix. Patch nào không áp được thì
 #   workflow dừng và báo đúng tên patch đó.
 #
-# CẬP NHẬT TRONG APP: APK đăng lên Releases của CHÍNH repo này, tên file bắt đầu bằng đúng UPDATE_APK_PREFIX
-# của app (hiện là "Bit-", đọc thẳng từ app/build.gradle.kts), tag v1.9.1.N với N = số của release mới nhất + 1.
-# Khoá ký: ưu tiên secret DEBUG_KEYSTORE_B64 (base64 của debug.keystore); không có thì dùng cache (có thể bị
-# GitHub xoá sau 7 ngày không dùng, lúc đó APK ký khoá mới và Android không cho cài đè). Bật input
-# "export_key" một lần để tải khoá về làm secret.
+# CẬP NHẬT ĐÈ LÊN APP CŨ: build đúng app của workflow "Bit Dev APK" (dev-benchmark): cùng tên gói (mặc định
+# com.bit.dev, đổi bằng input "app_package"), cùng nhãn "Bit Dev", cùng khoá ký (secret KEYSTORE_BASE64... hoặc khoá
+# dev nhúng sẵn trong dev-benchmark), nên APK cài ĐÈ lên app cũ thay vì thành một app mới. Android chỉ cài đè khi
+# tên gói VÀ khoá ký trùng nhau.
+# APK đăng lên Releases của CHÍNH repo này, tên file bắt đầu bằng UPDATE_APK_PREFIX của app (đọc từ
+# app/build.gradle.kts, hiện là "Bit-"), tag v1.9.1.N với N = số lớn nhất trong các tag release của repo + 1.
 #
 # NỀN: bản APK thật của bạn (all-in-one + dòng trạng thái loop mix + gom cài đặt "Nâng cao").
 # Workflow này gồm đủ cả ba, nên dùng NÓ THAY CHO automix-verdict-line, không chạy chung hai cái.
@@ -63,7 +67,7 @@ on:
         type: boolean
         default: false
       build_apk:
-        description: "Build APK dev benchmark (R8 + baseline profile, ký bằng khoá debug)"
+        description: "Build APK dev release (R8, ký bằng khoá của Bit Dev APK, cài đè lên app cũ)"
         type: boolean
         default: true
       publish_release:
@@ -78,10 +82,14 @@ on:
         description: "Gộp patch \"tách giọng\": thêm khả năng tách giọng / nhạc nền (open-unmix)"
         type: boolean
         default: true
-      export_key:
-        description: "Tải khoá ký debug về dạng artifact (1 ngày) để dán vào secret DEBUG_KEYSTORE_B64, một lần là đủ"
+      stem_mix:
+        description: "Nối tách giọng vào Automix: giọng bài cũ ra trước, giọng bài mới vào sau (cần stem_separation)"
         type: boolean
-        default: false
+        default: true
+      app_package:
+        description: "Tên gói của app cần cài đè lên (mặc định com.bit.dev = app build từ workflow Bit Dev APK)"
+        type: string
+        default: "com.bit.dev"
       push_branch:
         description: "Đẩy bản đã vá sang nhánh automix-manual-mix (để bạn mở PR). Tắt = không commit gì"
         type: boolean
@@ -3044,32 +3052,546 @@ jobs:
                    sourceResolutionScope.cancel()
           PATCH_EOF
 
+      - name: Write the stem mix patch
+        if: ${{ inputs.stem_separation && inputs.stem_mix }}
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/automix-stem-mix.patch" <<'PATCH_EOF'
+          diff --git a/app/src/main/cpp/jni/loopmix_jni.cpp b/app/src/main/cpp/jni/loopmix_jni.cpp
+          index 5ac10c5..5716359 100644
+          --- a/app/src/main/cpp/jni/loopmix_jni.cpp
+          +++ b/app/src/main/cpp/jni/loopmix_jni.cpp
+          @@ -80,6 +80,7 @@ Java_com_music_bitchord_playback_loopmix_LoopMixRenderer_nativeSetEnvelope(
+               case 4: envelope = &deck->midDb; break;
+               case 5: envelope = &deck->highDb; break;
+               case 6: envelope = &deck->lowPassHz; break;
+          +    case 7: envelope = &deck->vocalGain; break;
+               default: break;
+             }
+             if (envelope == nullptr) return;
+          @@ -91,6 +92,18 @@ Java_com_music_bitchord_playback_loopmix_LoopMixRenderer_nativeSetEnvelope(
+             envelope->exponential = exponential;
+           }
+           
+          +JNIEXPORT void JNICALL
+          +Java_com_music_bitchord_playback_loopmix_LoopMixRenderer_nativeSetVocal(
+          +    JNIEnv* env, jclass, jlong handle, jint index, jfloatArray left, jfloatArray right) {
+          +  Deck* deck = DeckOf(handle, index);
+          +  if (deck == nullptr) return;
+          +  const jsize frames = std::min(env->GetArrayLength(left), env->GetArrayLength(right));
+          +  deck->vocalLeft.resize(frames);
+          +  deck->vocalRight.resize(frames);
+          +  env->GetFloatArrayRegion(left, 0, frames, deck->vocalLeft.data());
+          +  env->GetFloatArrayRegion(right, 0, frames, deck->vocalRight.data());
+          +}
+          +
+           JNIEXPORT void JNICALL
+           Java_com_music_bitchord_playback_loopmix_LoopMixRenderer_nativePrepare(JNIEnv*, jclass, jlong handle) {
+             if (handle != 0) From(handle)->prepare();
+          diff --git a/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt b/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt
+          index 2471518..af17b00 100644
+          --- a/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt
+          +++ b/app/src/main/java/com/music/bitchord/playback/CrossfadeController.kt
+          @@ -32,6 +32,7 @@ import com.music.bitchord.playback.smart.LoopMix
+           import com.music.bitchord.playback.smart.OverlapMix
+           import com.music.bitchord.playback.smart.OverrideStyle
+           import com.music.bitchord.playback.smart.REASON_USER_OFF
+          +import com.music.bitchord.playback.smart.StemSet
+           import com.music.bitchord.playback.smart.TransitionOverride
+           import com.music.bitchord.playback.smart.manualWindowUnit
+           import com.music.bitchord.playback.smart.FILTER_ECHO_AT
+          @@ -241,6 +242,8 @@ class CrossfadeController(
+               private val loudnessGain: (String) -> Float = { 1f },
+               /** The session's playhead moved on purpose during a loop mix: a loop wrap (true) or a re-anchor (false). */
+               private val onMixPositionJump: (wrapped: Boolean) -> Unit = {},
+          +    /** Splits a stretch of a song into vocals and instrumental, for the blend's stem handover; null result skips it. */
+          +    private val separateStems: (FloatArray, FloatArray, Double) -> StemSet? = { _, _, _ -> null },
+           ) {
+           
+               private enum class Phase {
+          @@ -2868,7 +2871,10 @@ class CrossfadeController(
+                       val began = SystemClock.elapsedRealtime()
+                       val session = withContext(Dispatchers.Default) {
+                           runCatching {
+          -                    BlendMixSession.build(plan, label, outItem.mediaId, inItem.mediaId, sampleRate, inLevel) { side, from, to ->
+          +                    BlendMixSession.build(
+          +                        plan, label, outItem.mediaId, inItem.mediaId, sampleRate, inLevel,
+          +                        stemSplit = separateStems,
+          +                    ) { side, from, to ->
+                                   if (side == LoopMix.Side.OUT) {
+                                       loopRegion(outItem, durationMs, from, to, sampleRate)
+                                   } else {
+          diff --git a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+          index 9b17ba2..34290fa 100644
+          --- a/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+          +++ b/app/src/main/java/com/music/bitchord/playback/PlaybackService.kt
+          @@ -2016,6 +2016,7 @@ class PlaybackService : MediaLibraryService() {
+                       syncedLines = ::loopMixLyrics,
+                       loudnessGain = ::loudnessGainFor,
+                       onMixPositionJump = { wrapped -> (mediaSession?.player as? SessionPlayer)?.announceMixPosition(wrapped) },
+          +            separateStems = { left, right, rate -> trackAnalyzer.separateStems(left, right, rate) },
+                   )
+           
+               /**
+          diff --git a/app/src/main/java/com/music/bitchord/playback/loopmix/BlendMixSession.kt b/app/src/main/java/com/music/bitchord/playback/loopmix/BlendMixSession.kt
+          index e1440d4..c4f2e62 100644
+          --- a/app/src/main/java/com/music/bitchord/playback/loopmix/BlendMixSession.kt
+          +++ b/app/src/main/java/com/music/bitchord/playback/loopmix/BlendMixSession.kt
+          @@ -3,7 +3,11 @@ package com.music.bitchord.playback.loopmix
+           import android.util.Log
+           import com.music.bitchord.playback.smart.BlendMix
+           import com.music.bitchord.playback.smart.LoopMix
+          +import com.music.bitchord.playback.smart.MelSpectrogram
+           import com.music.bitchord.playback.smart.OverlapMix
+          +import com.music.bitchord.playback.smart.StemSet
+          +import kotlin.math.PI
+          +import kotlin.math.cos
+           import kotlin.math.max
+           
+           /**
+          @@ -22,6 +26,19 @@ object BlendMixSession {
+               /** The incoming deck starts this many mix seconds before the blend, so its first audible sample is settled. */
+               private const val IN_LEAD_SECONDS = 0.6
+           
+          +    /** Blends shorter than this are left whole: there is no room to hand the vocals over. */
+          +    private const val STEM_MIN_FADE_SECONDS = 4.0
+          +
+          +    /** Most seconds of a deck's region handed to the separator (its window is about 22 s; keep clear of the edge). */
+          +    private const val STEM_WINDOW_SECONDS = 20.0
+          +
+          +    /** The separated stretch of the outgoing deck starts this long before the blend. */
+          +    private const val STEM_LEAD_SECONDS = 1.0
+          +
+          +    /** The outgoing vocals leave over the first share of the blend; the incoming ones enter after this share of it. */
+          +    private const val STEM_OUT_SHARE = 0.4
+          +    private const val STEM_IN_FROM_SHARE = 0.55
+          +
+               /** Blocking: call off the main thread. [decode] returns track seconds from..to at [sampleRate], or null. */
+               fun build(
+                   plan: BlendMix.Plan,
+          @@ -30,6 +47,8 @@ object BlendMixSession {
+                   inId: String,
+                   sampleRate: Int,
+                   inLevel: Float,
+          +        /** Splits a stretch of a song into vocals and instrumental; null skips the stem handover. */
+          +        stemSplit: ((left: FloatArray, right: FloatArray, rate: Double) -> StemSet?)? = null,
+                   decode: (side: LoopMix.Side, from: Double, to: Double) -> LoopRegion?,
+               ): LoopMixSession? {
+                   if (!LoopMixRenderer.available || sampleRate <= 0) return null
+          @@ -117,17 +136,98 @@ object BlendMixSession {
+                       renderer.setEcho(LoopMixRenderer.OUT, plan.echoSeconds, OverlapMix.ECHO_FEEDBACK, OverlapMix.ECHO_RETURN)
+                       renderer.setEnvelope(LoopMixRenderer.OUT, LoopMixRenderer.KIND_ECHO_SEND, send.times, send.values)
+                   }
+          +        // Stem handover: the outgoing vocals leave first, the instrumentals blend, the incoming vocals enter last,
+          +        // so the two voices are never heard over each other. Either deck without stems is simply left whole.
+          +        var stemmed = ""
+          +        if (stemSplit != null && plan.fadeSeconds >= STEM_MIN_FADE_SECONDS) {
+          +            val began = System.nanoTime()
+          +            val fade = plan.fadeSeconds
+          +            val outVocals = runCatching {
+          +                vocalsOf(
+          +                    region = outRegion,
+          +                    fromTrack = plan.takeover + plan.outElapsed(plan.fadeStart) - STEM_LEAD_SECONDS,
+          +                    mustCoverTo = outRegion.start + minOf(outRegion.left.size, outRegion.right.size) / sr - 2.0,
+          +                    sampleRate = sampleRate,
+          +                    split = stemSplit,
+          +                )
+          +            }.getOrNull()
+          +            val inVocals = runCatching {
+          +                vocalsOf(
+          +                    region = inRegion,
+          +                    fromTrack = inRegion.start,
+          +                    mustCoverTo = plan.inCue + plan.inRate * fade,
+          +                    sampleRate = sampleRate,
+          +                    split = stemSplit,
+          +                )
+          +            }.getOrNull()
+          +            if (outVocals != null) {
+          +                renderer.setVocals(LoopMixRenderer.OUT, outVocals.first, outVocals.second)
+          +                val (times, values) = vocalRamp(plan.fadeStart, plan.fadeStart + fade * STEM_OUT_SHARE, leaving = true)
+          +                renderer.setEnvelope(LoopMixRenderer.OUT, LoopMixRenderer.KIND_VOCAL_GAIN, times, values)
+          +            }
+          +            if (inVocals != null) {
+          +                renderer.setVocals(LoopMixRenderer.IN, inVocals.first, inVocals.second)
+          +                val (times, values) = vocalRamp(plan.fadeStart + fade * STEM_IN_FROM_SHARE, plan.fadeEnd, leaving = false)
+          +                renderer.setEnvelope(LoopMixRenderer.IN, LoopMixRenderer.KIND_VOCAL_GAIN, times, values)
+          +            }
+          +            stemmed = ", stems out ${outVocals != null} in ${inVocals != null} (${(System.nanoTime() - began) / 1_000_000} ms)"
+          +        }
+                   renderer.prepare()
+                   // The incoming deck hands over to its own player at the same track position.
+                   renderer.setFadeOut(LoopMixRenderer.IN, clock.elementTrackTime)
+                   Log.d(
+                       TAG,
+                       "built $label: takeover ${"%.2f".format(plan.takeover)}s, blend ${"%.2f".format(plan.fadeStart)}..${"%.2f".format(plan.fadeEnd)}s, " +
+          -                "tempo out ${"%.3f".format(plan.outRate)} in ${"%.3f".format(plan.inRate)}",
+          +                "tempo out ${"%.3f".format(plan.outRate)} in ${"%.3f".format(plan.inRate)}$stemmed",
+                   )
+                   return LoopMixSession(null, clock, outId, inId, renderer, sampleRate).also {
+                       it.label = label
+                       it.planIncomingStart()
+                   }
+               }
+          +
+          +    /** An S-curve over mix seconds [from]..[to] for a vocal gain: 1 down to 0 when [leaving], else 0 up to 1. */
+          +    private fun vocalRamp(from: Double, to: Double, leaving: Boolean): Pair<DoubleArray, FloatArray> {
+          +        val steps = 8
+          +        val times = DoubleArray(steps + 1) { from + (to - from) * it / steps }
+          +        val values = FloatArray(steps + 1) {
+          +            val rise = (0.5 - 0.5 * cos(PI * it / steps)).toFloat()
+          +            if (leaving) 1f - rise else rise
+          +        }
+          +        return times to values
+          +    }
+          +
+          +    /**
+          +     * The vocals of [region] from track second [fromTrack] for up to [STEM_WINDOW_SECONDS], as planar arrays the
+          +     * region's own length (zero outside the separated stretch), at the region's rate. Null when the separator
+          +     * has nothing, or when the stretch would end before track second [mustCoverTo] (the vocals would come back
+          +     * un-separated there).
+          +     */
+          +    private fun vocalsOf(
+          +        region: LoopRegion,
+          +        fromTrack: Double,
+          +        mustCoverTo: Double,
+          +        sampleRate: Int,
+          +        split: (left: FloatArray, right: FloatArray, rate: Double) -> StemSet?,
+          +    ): Pair<FloatArray, FloatArray>? {
+          +        val sr = sampleRate.toDouble()
+          +        val size = minOf(region.left.size, region.right.size)
+          +        val from = ((fromTrack - region.start) * sr).toInt().coerceIn(0, size)
+          +        val length = minOf(size - from, (STEM_WINDOW_SECONDS * sr).toInt())
+          +        if (length < (2.0 * sr).toInt()) return null
+          +        if (from + length < ((mustCoverTo - region.start) * sr).toInt()) return null
+          +        val stems = split(
+          +            region.left.copyOfRange(from, from + length),
+          +            region.right.copyOfRange(from, from + length),
+          +            sr,
+          +        ) ?: return null
+          +        val left = MelSpectrogram.resample(stems.vocalsLeft, stems.rate, sr) ?: return null
+          +        val right = MelSpectrogram.resample(stems.vocalsRight, stems.rate, sr) ?: return null
+          +        val count = minOf(left.size, right.size, length)
+          +        val vocalLeft = FloatArray(size)
+          +        val vocalRight = FloatArray(size)
+          +        System.arraycopy(left, 0, vocalLeft, from, count)
+          +        System.arraycopy(right, 0, vocalRight, from, count)
+          +        return vocalLeft to vocalRight
+          +    }
+           }
+          diff --git a/app/src/main/java/com/music/bitchord/playback/loopmix/LoopMixRenderer.kt b/app/src/main/java/com/music/bitchord/playback/loopmix/LoopMixRenderer.kt
+          index 240a66e..6fbc726 100644
+          --- a/app/src/main/java/com/music/bitchord/playback/loopmix/LoopMixRenderer.kt
+          +++ b/app/src/main/java/com/music/bitchord/playback/loopmix/LoopMixRenderer.kt
+          @@ -44,6 +44,13 @@ class LoopMixRenderer(val sampleRate: Int) : AutoCloseable {
+                   deck.knotFrames, deck.knotPositions, deck.runOn, deck.stopAt, deck.preroll, deck.level,
+               )
+           
+          +    /**
+          +     * The vocals of deck [index]'s region (planar, the region's own length and rate), for the stem split:
+          +     * with a [KIND_VOCAL_GAIN] envelope the deck takes them out of what it plays (1 = as recorded,
+          +     * 0 = instrumental alone). Call after [setDeck].
+          +     */
+          +    fun setVocals(index: Int, left: FloatArray, right: FloatArray) = nativeSetVocal(handle, index, left, right)
+          +
+               /**
+                * Automation over mix seconds: [KIND_GAIN] (linear), the three-band EQ in dB ([KIND_LOW_DB] a 250 Hz
+                * shelf, [KIND_MID_DB] a 1 kHz bell, [KIND_HIGH_DB] a 4 kHz shelf), the filter pair in Hz
+          @@ -87,6 +94,7 @@ class LoopMixRenderer(val sampleRate: Int) : AutoCloseable {
+                   const val KIND_MID_DB = 4
+                   const val KIND_HIGH_DB = 5
+                   const val KIND_LOW_PASS_HZ = 6
+          +        const val KIND_VOCAL_GAIN = 7
+           
+                   val available: Boolean = runCatching { System.loadLibrary("bitchord_loopmix") }
+                       .onFailure { Log.w("BitChordLoopMix", "Loop mix renderer unavailable", it) }
+          @@ -99,6 +107,9 @@ class LoopMixRenderer(val sampleRate: Int) : AutoCloseable {
+                       loopStart: Long, loopEnd: Long, releaseAt: Double, knotFrames: DoubleArray, knotPositions: DoubleArray,
+                       runOn: Boolean, stopAt: Double, preroll: Double, level: Float,
+                   )
+          +        @JvmStatic private external fun nativeSetVocal(
+          +            handle: Long, index: Int, left: FloatArray, right: FloatArray,
+          +        )
+                   @JvmStatic private external fun nativeSetEnvelope(
+                       handle: Long, index: Int, kind: Int, times: DoubleArray, values: FloatArray, exponential: Boolean,
+                   )
+          diff --git a/native/loopmix/loop_mix_renderer.cpp b/native/loopmix/loop_mix_renderer.cpp
+          index 55aa3f2..28c21da 100644
+          --- a/native/loopmix/loop_mix_renderer.cpp
+          +++ b/native/loopmix/loop_mix_renderer.cpp
+          @@ -232,6 +232,9 @@ void Renderer::renderDeck(Deck& deck, int64_t frame, int frames) {
+               deck.finished = true;
+               return;
+             }
+          +  // Stem split: how much of the region's vocals to take out of the input at mix second t.
+          +  const bool split = !deck.vocalGain.empty() && !deck.vocalLeft.empty() &&
+          +                     deck.vocalLeft.size() == deck.left.size() && deck.vocalRight.size() == deck.right.size();
+             const double inLatency = deck.stretch.inputLatency();
+             const double outLatency = deck.stretch.outputLatency();
+             const double startTime = deck.knotTimes.front() / sr - deck.preroll - outLatency / sr;
+          @@ -251,10 +254,15 @@ void Renderer::renderDeck(Deck& deck, int64_t frame, int frames) {
+                 inRight_.resize(seekLength);
+               }
+               const int64_t first = int64_t(std::llround(deck.readPos)) - seekLength;
+          +    const float seekRemoved = split ? 1.f - deck.vocalGain.at(blockStart + (inLatency + outLatency) / sr) : 0.f;
+               for (int i = 0; i < seekLength; ++i) {
+                 const int64_t index = deck.sampleAt(first + i);
+                 inLeft_[i] = index >= 0 ? deck.left[index] : 0.f;
+                 inRight_[i] = index >= 0 ? deck.right[index] : 0.f;
+          +      if (split && index >= 0 && seekRemoved != 0.f) {
+          +        inLeft_[i] -= deck.vocalLeft[index] * seekRemoved;
+          +        inRight_[i] -= deck.vocalRight[index] * seekRemoved;
+          +      }
+               }
+               float* seekInput[2] = {inLeft_.data(), inRight_.data()};
+               deck.stretch.reset();
+          @@ -288,10 +296,23 @@ void Renderer::renderDeck(Deck& deck, int64_t frame, int frames) {
+               inRight_.resize(inputSamples);
+             }
+             const int64_t readFrom = int64_t(deck.readPos);
+          +  float removed = 0.f;
+             for (int i = 0; i < inputSamples; ++i) {
+               const int64_t index = deck.sampleAt(readFrom + i);
+               inLeft_[i] = index >= 0 ? deck.left[index] : 0.f;
+               inRight_[i] = index >= 0 ? deck.right[index] : 0.f;
+          +    if (split) {
+          +      // Re-read every 64 input samples, spread evenly over the block's mix time.
+          +      if ((i & 63) == 0) {
+          +        const double at = blockStart + (blockEnd - blockStart) * double(i) / double(std::max(inputSamples, 1)) +
+          +                          (inLatency + outLatency) / sr;
+          +        removed = 1.f - deck.vocalGain.at(at);
+          +      }
+          +      if (index >= 0 && removed != 0.f) {
+          +        inLeft_[i] -= deck.vocalLeft[index] * removed;
+          +        inRight_[i] -= deck.vocalRight[index] * removed;
+          +      }
+          +    }
+             }
+             deck.readPos += inputSamples;
+           
+          diff --git a/native/loopmix/loop_mix_renderer.h b/native/loopmix/loop_mix_renderer.h
+          index e34c756..9455a20 100644
+          --- a/native/loopmix/loop_mix_renderer.h
+          +++ b/native/loopmix/loop_mix_renderer.h
+          @@ -87,6 +87,17 @@ struct Deck {
+             /** A plain gain on the deck (loudness matching between the two songs). */
+             float level = 1;
+           
+          +  /**
+          +   * Optional stem split: the region's vocals (planar, the region's own length and rate). With
+          +   * [vocalGain] set, the deck takes the vocals out of what it reads before the stretch, by
+          +   * `input = region - vocals * (1 - vocalGain)`: 1 plays the song as recorded, 0 plays the instrumental
+          +   * alone. The gain is read over mix seconds, at the time each input sample will be heard (the block's
+          +   * time plus the stretch's latency). Empty [vocalGain] or vocals: untouched.
+          +   */
+          +  std::vector<float> vocalLeft;
+          +  std::vector<float> vocalRight;
+          +  Envelope vocalGain;
+          +
+             Envelope gain;
+             /** The three-band EQ: a low shelf (250 Hz), a mid bell (1 kHz) and a high shelf (4 kHz), in dB. */
+             Envelope lowDb;
+          diff --git a/native/loopmix/tests/stem_mix_test.cpp b/native/loopmix/tests/stem_mix_test.cpp
+          new file mode 100644
+          index 0000000..bb040ac
+          --- /dev/null
+          +++ b/native/loopmix/tests/stem_mix_test.cpp
+          @@ -0,0 +1,151 @@
+          +// Host test for the stem split in the mix engine's deck: a deck given its region's vocals and a vocal gain
+          +// plays the song as recorded at gain 1 and the instrumental alone at gain 0. Measured on two tones, an
+          +// "instrument" and a "voice", through a real deck. Built and run by the workflow.
+          +#include <algorithm>
+          +#include <cmath>
+          +#include <cstdio>
+          +#include <vector>
+          +
+          +#include "loopmix/loop_mix_renderer.h"
+          +
+          +using bitchord::loopmix::Deck;
+          +using bitchord::loopmix::Renderer;
+          +
+          +namespace {
+          +
+          +constexpr int kRate = 48000;
+          +constexpr double kPi = 3.14159265358979323846;
+          +constexpr double kInstrumentHz = 220.0;
+          +constexpr double kVoiceHz = 1760.0;
+          +constexpr double kSeconds = 8.0;
+          +
+          +std::vector<float> tone(double hz, double seconds, float amplitude) {
+          +  std::vector<float> out(size_t(seconds * kRate));
+          +  for (size_t i = 0; i < out.size(); ++i) out[i] = amplitude * float(std::sin(2 * kPi * hz * double(i) / kRate));
+          +  return out;
+          +}
+          +
+          +struct Source {
+          +  std::vector<float> mix, voice;
+          +};
+          +
+          +Source source() {
+          +  Source s;
+          +  s.mix = tone(kInstrumentHz, kSeconds + 1.0, 0.3f);
+          +  s.voice = tone(kVoiceHz, kSeconds + 1.0, 0.3f);
+          +  for (size_t i = 0; i < s.mix.size(); ++i) s.mix[i] += s.voice[i];
+          +  return s;
+          +}
+          +
+          +void play(Deck& deck, const std::vector<float>& samples) {
+          +  deck.left = samples;
+          +  deck.right = samples;
+          +  deck.regionStart = 0;
+          +  deck.loopStart = 0;
+          +  deck.loopEnd = 0;
+          +  deck.releaseAt = 1e18;
+          +  deck.knotTimes = {0.0, kSeconds * kRate};
+          +  deck.knotPositions = {0.0, kSeconds * kRate};
+          +  deck.runOn = false;
+          +  deck.stopAt = kSeconds;
+          +  deck.preroll = 0.4;
+          +  deck.level = 1.f;
+          +}
+          +
+          +std::vector<float> render(Renderer& renderer) {
+          +  renderer.prepare();
+          +  std::vector<float> interleaved(2 * 1024), left;
+          +  const int64_t first = renderer.firstFrame();
+          +  for (int64_t frame = first; frame < int64_t(kSeconds * kRate); frame += 1024) {
+          +    renderer.render(frame, interleaved.data(), 1024);
+          +    for (int i = 0; i < 1024; ++i) left.push_back(interleaved[2 * i]);
+          +  }
+          +  return std::vector<float>(left.begin() + std::min<int64_t>(-first, left.size()), left.end());
+          +}
+          +
+          +/** The amplitude of a [hz] tone in x over [from, to) seconds (one-bin DFT). */
+          +double amplitude(const std::vector<float>& x, double hz, double from, double to) {
+          +  const size_t a = size_t(from * kRate), b = std::min(x.size(), size_t(to * kRate));
+          +  double re = 0, im = 0;
+          +  for (size_t i = a; i < b; ++i) {
+          +    const double phase = 2 * kPi * hz * double(i) / kRate;
+          +    re += x[i] * std::cos(phase);
+          +    im += x[i] * std::sin(phase);
+          +  }
+          +  return 2 * std::sqrt(re * re + im * im) / double(std::max<size_t>(1, b - a));
+          +}
+          +
+          +double db(double value, double reference) { return 20 * std::log10(std::max(value, 1e-9) / reference); }
+          +
+          +void gainRamp(bitchord::loopmix::Envelope& e, double t0, float v0, double t1, float v1) {
+          +  e.times = {t0, t1};
+          +  e.values = {v0, v1};
+          +}
+          +
+          +std::vector<float> run(const Source& s, bool split, double t0, float v0, double t1, float v1) {
+          +  Renderer renderer(kRate);
+          +  play(renderer.deck(0), s.mix);
+          +  if (split) {
+          +    renderer.deck(0).vocalLeft = s.voice;
+          +    renderer.deck(0).vocalRight = s.voice;
+          +    gainRamp(renderer.deck(0).vocalGain, t0, v0, t1, v1);
+          +  }
+          +  return render(renderer);
+          +}
+          +
+          +}  // namespace
+          +
+          +int main() {
+          +  int failures = 0;
+          +  auto expect = [&](bool ok, const char* what, double value) {
+          +    std::printf("%s  %-66s %8.2f\n", ok ? "ok  " : "FAIL", what, value);
+          +    if (!ok) ++failures;
+          +  };
+          +  const Source s = source();
+          +
+          +  // Reference: no stems. Both tones come through at 0.3.
+          +  const auto plain = run(s, false, 0, 1.f, 0, 1.f);
+          +  const double voice0 = amplitude(plain, kVoiceHz, 1.0, 2.0);
+          +  const double band0 = amplitude(plain, kInstrumentHz, 1.0, 2.0);
+          +  expect(std::fabs(db(voice0, 0.3)) < 1.0, "plain deck: the voice tone is at 0.3 (dB off)", db(voice0, 0.3));
+          +
+          +  // Gain 1 throughout: transparent.
+          +  const auto full = run(s, true, 0, 1.f, 100, 1.f);
+          +  expect(std::fabs(db(amplitude(full, kVoiceHz, 1.0, 2.0), voice0)) < 0.1, "vocal gain 1: the voice is untouched (dB)",
+          +         db(amplitude(full, kVoiceHz, 1.0, 2.0), voice0));
+          +  expect(std::fabs(db(amplitude(full, kInstrumentHz, 1.0, 2.0), band0)) < 0.1, "vocal gain 1: the instrument is untouched (dB)",
+          +         db(amplitude(full, kInstrumentHz, 1.0, 2.0), band0));
+          +
+          +  // Gain 1 -> 0 over 3..5 s: the voice leaves, the instrument stays.
+          +  const auto leaving = run(s, true, 3.0, 1.f, 5.0, 0.f);
+          +  const double early = amplitude(leaving, kVoiceHz, 1.0, 2.0);
+          +  const double mid = amplitude(leaving, kVoiceHz, 3.9, 4.1);
+          +  const double late = amplitude(leaving, kVoiceHz, 6.0, 7.0);
+          +  expect(std::fabs(db(early, voice0)) < 0.1, "leaving: before the ramp the voice is whole (dB)", db(early, voice0));
+          +  expect(std::fabs(db(mid, voice0) + 6.0) < 1.5, "leaving: halfway through the ramp the voice is at half (dB)", db(mid, voice0));
+          +  expect(db(late, voice0) < -40.0, "leaving: after the ramp the voice is gone (dB)", db(late, voice0));
+          +  expect(std::fabs(db(amplitude(leaving, kInstrumentHz, 6.0, 7.0), band0)) < 0.3, "leaving: the instrument is untouched at the end (dB)",
+          +         db(amplitude(leaving, kInstrumentHz, 6.0, 7.0), band0));
+          +
+          +  // Gain 0 -> 1 over 4..6 s: the voice is absent, then comes in.
+          +  const auto entering = run(s, true, 4.0, 0.f, 6.0, 1.f);
+          +  expect(db(amplitude(entering, kVoiceHz, 1.0, 2.0), voice0) < -40.0, "entering: the voice is absent at the start (dB)",
+          +         db(amplitude(entering, kVoiceHz, 1.0, 2.0), voice0));
+          +  expect(std::fabs(db(amplitude(entering, kVoiceHz, 6.5, 7.5), voice0)) < 0.2, "entering: the voice is whole at the end (dB)",
+          +         db(amplitude(entering, kVoiceHz, 6.5, 7.5), voice0));
+          +  expect(std::fabs(db(amplitude(entering, kInstrumentHz, 1.0, 2.0), band0)) < 0.3, "entering: the instrument plays from the start (dB)",
+          +         db(amplitude(entering, kInstrumentHz, 1.0, 2.0), band0));
+          +
+          +  // Vocals of the wrong length are ignored rather than read out of bounds.
+          +  Renderer odd(kRate);
+          +  play(odd.deck(0), s.mix);
+          +  odd.deck(0).vocalLeft.assign(1000, 0.1f);
+          +  odd.deck(0).vocalRight.assign(1000, 0.1f);
+          +  gainRamp(odd.deck(0).vocalGain, 0, 0.f, 1, 0.f);
+          +  const auto oddOut = render(odd);
+          +  expect(std::fabs(db(amplitude(oddOut, kVoiceHz, 1.0, 2.0), voice0)) < 0.1, "mismatched vocal length: the deck plays as recorded (dB)",
+          +         db(amplitude(oddOut, kVoiceHz, 1.0, 2.0), voice0));
+          +
+          +  std::printf(failures == 0 ? "stem mix test OK\n" : "stem mix test FAILED\n");
+          +  return failures == 0 ? 0 : 1;
+          +}
+          PATCH_EOF
+
       - name: Apply the patches
         shell: bash
         env:
           NO_SPEEDUP: ${{ inputs.no_speedup }}
           STEMS: ${{ inputs.stem_separation }}
+          STEM_MIX: ${{ inputs.stem_mix }}
         run: |
           set -euo pipefail
           # dev-benchmark (1).yml chạy lại bước này chỉ với CHAIN_FILE, không có hai biến dưới: mặc định tắt.
           NO_SPEEDUP="${NO_SPEEDUP:-false}"
           STEMS="${STEMS:-false}"
+          STEM_MIX="${STEM_MIX:-false}"
           APPLIED=already
           PATCHES=("$RUNNER_TEMP/automix-manual-mix.patch")
           if [ "$NO_SPEEDUP" = "true" ]; then PATCHES+=("$RUNNER_TEMP/automix-no-speedup.patch"); fi
           if [ "$STEMS" = "true" ]; then PATCHES+=("$RUNNER_TEMP/automix-stems.patch"); fi
-          for P in "${PATCHES[@]}"; do
+          # Nối tách giọng vào mix cần chính khả năng tách, nên đi sau patch tách giọng.
+          if [ "$STEMS" = "true" ] && [ "$STEM_MIX" = "true" ]; then PATCHES+=("$RUNNER_TEMP/automix-stem-mix.patch"); fi
+          # 1) Gỡ tạm những patch đã có sẵn trong cây (patch cuối trước), vì các patch sau chồng lên cùng file với
+          #    patch trước nên kiểm tra "đã áp" từng patch riêng lẻ sẽ sai.
+          PEELED=()
+          for (( i=${#PATCHES[@]}-1; i>=0; i-- )); do
+            P="${PATCHES[$i]}"
             if git apply --reverse --check "$P" 2>/dev/null; then
-              echo "Đã có sẵn trong repo, bỏ qua: $(basename "$P")"
-              continue
+              git apply --reverse "$P"
+              PEELED=("$P" "${PEELED[@]}")
+            else
+              break
             fi
+          done
+          # 2) Áp lần lượt tất cả. Patch vừa gỡ tạm chỉ là đưa về chỗ cũ; patch khác là mới.
+          for P in "${PATCHES[@]}"; do
             if ! git apply --check "$P"; then
               echo "::error::Patch $(basename "$P") không áp được lên bản này (một trong các file đã bị sửa so với bản dùng để viết patch). Gửi lại các file bị báo lệch ở trên để chỉnh patch."
               exit 1
             fi
             git apply "$P"
-            APPLIED=yes
-            echo "Đã áp: $(basename "$P")"
+            if [[ " ${PEELED[*]-} " == *" $P "* ]]; then
+              echo "Đã có sẵn trong repo: $(basename "$P")"
+            else
+              APPLIED=yes
+              echo "Đã áp: $(basename "$P")"
+            fi
           done
           echo "APPLIED=$APPLIED" >> "$GITHUB_ENV"
           {
@@ -3089,7 +3611,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A -- app shared sharedUi native docs
-          git commit -m "Automix: manual mix window, no tempo change, stem separation (as enabled)"
+          git commit -m "Automix: manual mix window, no tempo change, stem separation and handover (as enabled)"
 
       - name: Native self-test (stem separation core)
         if: ${{ inputs.stem_separation }}
@@ -3108,6 +3630,22 @@ jobs:
             sed 's/^/    /' "$RUNNER_TEMP/stem_test.log"
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Native self-test (stem handover in the mix engine)
+        if: ${{ inputs.stem_separation && inputs.stem_mix }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          g++ -std=c++17 -O1 -Wall -Wextra -I native \
+            -I native/third_party/signalsmith-stretch -I native/third_party/signalsmith-linear -I native/third_party \
+            native/loopmix/tests/stem_mix_test.cpp native/loopmix/loop_mix_renderer.cpp \
+            -o "$RUNNER_TEMP/stem_mix_test"
+          "$RUNNER_TEMP/stem_mix_test" | tee "$RUNNER_TEMP/stem_mix_test.log"
+          {
+            echo "### Stem handover self-test (mix engine)"
+            echo
+            sed 's/^/    /' "$RUNNER_TEMP/stem_mix_test.log"
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
@@ -3117,10 +3655,16 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
 
       - name: Write local.properties
+        env:
+          S_LASTFM_KEY: ${{ secrets.LASTFM_API_KEY }}
+          S_LASTFM_SECRET: ${{ secrets.LASTFM_SECRET }}
+          S_LISTEN: ${{ secrets.LISTEN_TOGETHER_SERVER }}
         run: |
-          echo "LASTFM_API_KEY=" > local.properties
-          echo "LASTFM_SECRET=" >> local.properties
-          echo "LISTEN_TOGETHER_SERVER=" >> local.properties
+          {
+            echo "LASTFM_API_KEY=$S_LASTFM_KEY"
+            echo "LASTFM_SECRET=$S_LASTFM_SECRET"
+            echo "LISTEN_TOGETHER_SERVER=$S_LISTEN"
+          } > local.properties
 
       - run: chmod +x gradlew
 
@@ -3177,34 +3721,41 @@ jobs:
           fi
           sed -n '/FetchContent_Declare(libusb/,/FetchContent_MakeAvailable(libusb)/p' "$CM"
 
-      - name: Use the signing key from the repo secret (if set)
+      - name: Rename to the same app as Bit Dev APK (so the update installs over it)
         if: ${{ inputs.build_apk }}
         shell: bash
         env:
-          KEY_B64: ${{ secrets.DEBUG_KEYSTORE_B64 }}
+          APP_PACKAGE: ${{ inputs.app_package }}
         run: |
-          if [ -n "$KEY_B64" ]; then
-            mkdir -p ~/.android
-            echo "$KEY_B64" | base64 -d > ~/.android/debug.keystore
-            echo "KEY_SOURCE=secret" >> "$GITHUB_ENV"
-            echo "Khoá ký: lấy từ secret DEBUG_KEYSTORE_B64" >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "KEY_SOURCE=cache" >> "$GITHUB_ENV"
+          set -euo pipefail
+          APP_PACKAGE="${APP_PACKAGE:-com.bit.dev}"
+          sed -i "s/com\.dev\.bitchord/${APP_PACKAGE}/g; s/BitChord Dev/Bit Dev/g" \
+            app/build.gradle.kts app/src/dev/AndroidManifest.xml wearos/build.gradle.kts tv/build.gradle.kts
+          grep -q "applicationId = \"${APP_PACKAGE}\"" app/build.gradle.kts
+          echo "Tên gói app: ${APP_PACKAGE}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Setup signing key (same as Bit Dev APK)
+        if: ${{ inputs.build_apk }}
+        env:
+          S_KS_B64: ${{ secrets.KEYSTORE_BASE64 }}
+          S_KS_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+          S_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          S_KEY_PASS: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          KS_B64="$S_KS_B64"; KS_PASS="$S_KS_PASS"; KEY_ALIAS="$S_KEY_ALIAS"; KEY_PASS="$S_KEY_PASS"
+          if [ -z "$KS_B64" ]; then
+            KS_B64='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'
+            KS_PASS='M8rnSCC3C4TkChAh'
+            KEY_ALIAS='bitdev'
+            KEY_PASS='M8rnSCC3C4TkChAh'
           fi
-
-      - name: Keep the same debug signing key between runs
-        id: keycache
-        if: ${{ inputs.build_apk && env.KEY_SOURCE == 'cache' }}
-        uses: actions/cache@v4
-        with:
-          path: ~/.android/debug.keystore
-          key: debug-keystore-v1-${{ github.repository }}
-
-      - name: Warn when the signing key is brand new
-        if: ${{ inputs.build_apk && env.KEY_SOURCE == 'cache' && steps.keycache.outputs.cache-hit != 'true' }}
-        run: |
-          echo "::warning::Không tìm thấy khoá ký trong cache: APK này sẽ ký bằng khoá MỚI. Nếu app đã cài ký bằng khoá cũ, Android sẽ không cho cài đè (phải gỡ app rồi cài lại). Đặt secret DEBUG_KEYSTORE_B64 để khỏi gặp lại."
-          echo "⚠️ Khoá ký mới (cache miss). Cài đè lên bản cũ có thể bị Android từ chối." >> "$GITHUB_STEP_SUMMARY"
+          echo "$KS_B64" | base64 -d > bitchord-release.jks
+          {
+            echo "storeFile=bitchord-release.jks"
+            echo "storePassword=$KS_PASS"
+            echo "keyAlias=$KEY_ALIAS"
+            echo "keyPassword=$KEY_PASS"
+          } > keystore.properties
 
       - name: Make the in-app updater follow this repo's releases
         if: ${{ inputs.build_apk }}
@@ -3216,16 +3767,20 @@ jobs:
           CHECKER=app/src/main/java/com/music/bitchord/data/AppUpdateChecker.kt
           BASE="$(grep -oP 'bitchordVersionName"\] = "\K[0-9]+(\.[0-9]+)*' build.gradle.kts)"
           CODE="$(grep -oP 'bitchordVersionCode"\] = \K[0-9]+' build.gradle.kts)"
-          # Số bản tiếp theo = số của release mới nhất trong repo + 1 (không dùng run_number vì mỗi workflow đếm riêng,
-          # chạy xen kẽ nhiều workflow sẽ ra số thấp hơn bản đang cài và app không báo cập nhật).
-          LAST="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name 2>/dev/null || true)"
+          # Số bản tiếp theo = số lớn nhất trong MỌI tag release của repo (kể cả của workflow Bit Dev APK) + 1, để luôn
+          # cao hơn app đang cài. Không dùng run_number vì mỗi workflow đếm riêng.
+          TAGS="$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" --paginate --jq '.[].tag_name' 2>/dev/null || true)"
+          MAX=-1
+          while IFS= read -r T; do
+            case "$T" in
+              "v${BASE}."*|"${BASE}."*)
+                X="${T##*.}"
+                if [[ "$X" =~ ^[0-9]+$ ]] && (( 10#$X > MAX )); then MAX=$(( 10#$X )); fi
+                ;;
+            esac
+          done <<< "$TAGS"
           N="${GITHUB_RUN_NUMBER}"
-          case "$LAST" in
-            "v${BASE}."*|"${BASE}."*)
-              TAIL="${LAST##*.}"
-              if [[ "$TAIL" =~ ^[0-9]+$ ]]; then N=$(( 10#$TAIL + 1 )); fi
-              ;;
-          esac
+          if (( MAX >= 0 )); then N=$(( MAX + 1 )); fi
           VER="${BASE}.${N}"
           # 1) Hỏi release mới nhất của CHÍNH repo này thay vì repo gốc.
           sed -i "s#repos/[A-Za-z0-9_.-]*/[A-Za-z0-9_.-]*/releases/latest#repos/${GITHUB_REPOSITORY}/releases/latest#" "$CHECKER"
@@ -3234,7 +3789,7 @@ jobs:
           sed -i "s#\(bitchordVersionName\"\] = \"\)[^\"]*#\1${VER}#; s#\(bitchordVersionCode\"\] = \)[0-9]*#\1$((CODE + N))#" build.gradle.kts
           grep -q "bitchordVersionName\"\] = \"${VER}\"" build.gradle.kts
           echo "APP_VERSION=${VER}" >> "$GITHUB_ENV"
-          echo "Phiên bản app: ${VER} (release trước: ${LAST:-chưa có})" >> "$GITHUB_STEP_SUMMARY"
+          echo "Phiên bản app: ${VER} (số lớn nhất trước đó: ${MAX})" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Build the release-like dev APK
         if: ${{ inputs.build_apk }}
@@ -3243,7 +3798,7 @@ jobs:
           set -o pipefail
           # GitHub tra loi 504 tam thoi cho cac lan tai: thu lai toi 3 lan, moi lan cach 30 giay.
           for attempt in 1 2 3; do
-            if ./gradlew assembleDevBenchmark 2>&1 | tee -a build.log; then
+            if ./gradlew assembleDevRelease 2>&1 | tee -a build.log; then
               exit 0
             fi
             echo "Build attempt $attempt failed" | tee -a build.log
@@ -3256,7 +3811,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: bitchord-automix-manual-mix-arm64
-          path: app/build/outputs/apk/dev/benchmark/*arm64-v8a*.apk
+          path: app/build/outputs/apk/dev/release/*arm64-v8a*.apk
           if-no-files-found: error
 
       - name: Publish the APK as a GitHub release
@@ -3265,9 +3820,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           NO_SPEEDUP: ${{ inputs.no_speedup }}
           STEMS: ${{ inputs.stem_separation }}
+          STEM_MIX: ${{ inputs.stem_mix }}
         run: |
           set -euo pipefail
-          SRC="$(ls app/build/outputs/apk/dev/benchmark/*arm64-v8a*.apk | head -n 1)"
+          SRC="$(ls app/build/outputs/apk/dev/release/*arm64-v8a*.apk 2>/dev/null | head -n 1 || true)"
+          if [ -z "$SRC" ]; then SRC="$(ls app/build/outputs/apk/dev/release/*.apk | head -n 1)"; fi
           # App chỉ nhận file .apk có tên bắt đầu bằng UPDATE_APK_PREFIX của chính nó: đọc thẳng từ app/build.gradle.kts.
           PREFIX="$(grep -oP 'UPDATE_APK_PREFIX", "\\"\K[^\\]+' app/build.gradle.kts | head -n 1)"
           if [ -z "$PREFIX" ]; then
@@ -3279,7 +3836,11 @@ jobs:
           TAG="v${APP_VERSION}"
           NOTES="APK arm64 dựng từ workflow automix-manual-mix. Gồm: chỉnh tay điểm mix từng cặp bài (popup Automix overview và nhấn giữ vệt sáng trên thanh tua), dịch lời bằng Gemini."
           if [ "$NO_SPEEDUP" = "true" ]; then NOTES="$NOTES Automix không còn đổi tốc độ nhạc khi chuyển bài (loop mix chỉ chạy khi hai bài cùng tempo)."; fi
-          if [ "$STEMS" = "true" ]; then NOTES="$NOTES Thêm khả năng tách giọng và nhạc nền (chưa nối vào phần mix)."; fi
+          if [ "$STEMS" = "true" ] && [ "$STEM_MIX" = "true" ]; then
+            NOTES="$NOTES Automix tách giọng khi chuyển bài: ở blend dài từ 4 giây, giọng bài cũ ra trước, nhạc nền hai bài hòa vào nhau, giọng bài mới vào sau."
+          elif [ "$STEMS" = "true" ]; then
+            NOTES="$NOTES Thêm khả năng tách giọng và nhạc nền (chưa nối vào phần mix)."
+          fi
           # Chạy lại (re-run) có thể trùng tag: xóa bản cũ cùng tag rồi tạo lại.
           gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes 2>/dev/null || true
           gh release create "$TAG" "$APK" \
@@ -3289,15 +3850,6 @@ jobs:
             --title "Automix tất cả trong một (${TAG})" \
             --notes "$NOTES"
           echo "Đã đăng lên Releases: $TAG ($(basename "$APK"))" >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Export the signing key (one time, to make the secret)
-        if: ${{ inputs.build_apk && inputs.export_key }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: debug-keystore
-          path: ~/.android/debug.keystore
-          retention-days: 1
-          if-no-files-found: error
 
       - name: Upload the test reports
         if: ${{ always() && inputs.run_tests }}
