@@ -1,0 +1,702 @@
+name: Automix - tách giọng và nhạc nền (open-unmix)
+
+# Chạy tay: tab Actions -> chọn workflow này -> Run workflow.
+# Một file duy nhất: patch nằm ngay trong file này (diff dạng chữ thường, KHÔNG nén/base64).
+# Mặc định KHÔNG commit gì vào repo. Bật "push_branch" nếu muốn đẩy sang nhánh để mở PR.
+#
+# Mục tiêu: Automix tách được giọng (vocals) và nhạc nền (instrumental) của một đoạn bài hát.
+# Dùng đúng model open-unmix "vocals" đã có sẵn trong app (vocals_umxhq_int8.onnx, MIT), không thêm model.
+#
+# Cách làm: model chỉ trả về ĐỘ LỚN phổ của giọng, không phải âm thanh. Patch lấy STFT phức của bản mix
+# (đúng cấu hình của model: FFT 4096, hop 1024, Hann chu kỳ, reflect pad), nhân từng bin với mask
+# = clamp(giọng / mix, 0, 1), rồi ISTFT ra tín hiệu giọng. Instrumental = mix - giọng, nên cộng lại
+# đúng bằng bản gốc từng mẫu.
+#
+# File thêm / sửa:
+#   native/analyzer/stem_separation.{h,cpp}        lõi C++ (STFT phức, mask, ISTFT)
+#   native/analyzer/tests/stem_separation_test.cpp  test chạy trên máy host, workflow chạy luôn
+#   app/src/main/cpp/jni/stem_jni.cpp + CMakeLists  cầu JNI, đăng ký vào libbitchord_analysis
+#   VocalTracker.kt: StemSet, StemSeparation, VocalTracker.separate(left, right, rate)
+#   TrackAnalyzer.kt: separateStems(left, right, rate) cho phần còn lại của app gọi
+#
+# ĐÃ KIỂM TRA khi viết: lõi C++ khớp bản numpy độc lập (sai số ~3e-8), mask 1 trả lại đúng bản mix,
+# chạy được với model ONNX thật. CHƯA kiểm: phần Kotlin (không có kotlinc ở chỗ viết, step build APK
+# sẽ báo nếu sai chữ ký) và chất lượng tách trên nhạc thật.
+#
+# CHƯA LÀM: nối stem vào phần mix. Patch này chỉ thêm khả năng tách. Chưa có transition nào dùng stem
+# (giọng bài cũ ra trước, nhạc nền đổi chỗ, giọng bài mới vào sau). Việc đó cần bộ render nhiều deck
+# và sửa luồng loop mix trong CrossfadeController, nên làm ở bước sau.
+#
+# Giới hạn: một cửa sổ model (~22 giây, FIXED_FRAMES = 960), giống VocalTracker.track.
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_tests:
+        description: "Chạy test của module shared trước khi build (khuyến nghị)"
+        type: boolean
+        default: true
+      build_apk:
+        description: "Build APK dev benchmark (R8 + baseline profile, ký bằng khoá debug)"
+        type: boolean
+        default: true
+      push_branch:
+        description: "Đẩy bản đã vá sang nhánh automix-stems (để bạn mở PR). Tắt = không commit gì"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: automix-stems-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      FIX_BRANCH: automix-stems
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Write the patch
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/automix-stems.patch" <<'PATCH_EOF'
+          diff --git a/native/analyzer/stem_separation.h b/native/analyzer/stem_separation.h
+          new file mode 100644
+          --- /dev/null
+          +++ b/native/analyzer/stem_separation.h
+          @@ -0,0 +1,37 @@
+          +// Turns the open-unmix "vocals" magnitude estimate into an actual vocal signal.
+          +//
+          +// vocal_spectrogram.h feeds the model the magnitude STFT of the mix; the model
+          +// answers with the magnitude of the vocals. A magnitude is not audio, so this
+          +// takes the mix's *complex* STFT (same settings, same padding), scales every
+          +// bin by the ratio mask target / mix, and inverts it. The instrumental is what
+          +// is left: mix - vocals, formed by the caller, which makes the two sum back to
+          +// the original exactly instead of to whatever a second model would guess.
+          +//
+          +// Same constants as the front end because they are the network's, not ours.
+          +// Planar stereo Float32 in, at kVocalSpectrogramSampleRate; the caller owns
+          +// resampling. Reentrant, allocates, O(n log n): a worker thread's job.
+          +
+          +#pragma once
+          +
+          +#include <cstddef>
+          +#include <vector>
+          +
+          +#include "vocal_spectrogram.h"
+          +
+          +namespace bitchord::smart {
+          +
+          +// `target` is the model's output tensor, [channel][bin][target_stride], i.e.
+          +// bin-major with `target_stride` frames per bin (the model's fixed width, which
+          +// is at least the number of frames the input produced). Returns the vocals as
+          +// planar stereo, the same length as the input; empty on any mismatch.
+          +std::vector<std::vector<float>> ExtractVocals(
+          +  const std::vector<std::vector<float>>& channels,
+          +  const float* target,
+          +  size_t target_stride
+          +);
+          +
+          +// The mask applied to one bin: how much of the mix the model says is vocal.
+          +// Exposed so the test can pin the exact rule.
+          +float VocalMask(float target_magnitude, float mix_magnitude);
+          +
+          +}  // namespace bitchord::smart
+          diff --git a/native/analyzer/stem_separation.cpp b/native/analyzer/stem_separation.cpp
+          new file mode 100644
+          --- /dev/null
+          +++ b/native/analyzer/stem_separation.cpp
+          @@ -0,0 +1,140 @@
+          +#include "stem_separation.h"
+          +
+          +#include <algorithm>
+          +#include <cmath>
+          +#include <complex>
+          +
+          +namespace bitchord::smart {
+          +namespace {
+          +
+          +constexpr double kPi = 3.14159265358979323846;
+          +using Complex = std::complex<double>;
+          +
+          +// Unnormalized in-place radix-2 FFT, forward (negative exponent). Each
+          +// translation unit in this directory carries its own copy.
+          +void Fft(std::vector<Complex>& values) {
+          +  const size_t size = values.size();
+          +  for (size_t index = 1, swapped = 0; index < size; ++index) {
+          +    size_t bit = size >> 1;
+          +    for (; swapped & bit; bit >>= 1) swapped ^= bit;
+          +    swapped ^= bit;
+          +    if (index < swapped) std::swap(values[index], values[swapped]);
+          +  }
+          +  for (size_t length = 2; length <= size; length <<= 1) {
+          +    const Complex root = std::polar(1.0, -2.0 * kPi / length);
+          +    for (size_t start = 0; start < size; start += length) {
+          +      Complex weight(1, 0);
+          +      for (size_t offset = 0; offset < length / 2; ++offset) {
+          +        const auto even = values[start + offset];
+          +        const auto odd = values[start + offset + length / 2] * weight;
+          +        values[start + offset] = even + odd;
+          +        values[start + offset + length / 2] = even - odd;
+          +        weight *= root;
+          +      }
+          +    }
+          +  }
+          +}
+          +
+          +// Periodic Hann, torch.hann_window(periodic=True): same as the front end.
+          +std::vector<double> HannWindow(size_t size) {
+          +  std::vector<double> window(size);
+          +  for (size_t index = 0; index < size; ++index) {
+          +    window[index] = 0.5 - 0.5 * std::cos(2.0 * kPi * static_cast<double>(index) / size);
+          +  }
+          +  return window;
+          +}
+          +
+          +// Reflect padding, exactly as ComputeVocalSpectrogram does it.
+          +std::vector<float> ReflectPad(const std::vector<float>& in, size_t pad) {
+          +  const size_t n = in.size();
+          +  std::vector<float> out;
+          +  out.reserve(n + 2 * pad);
+          +  for (size_t index = pad; index >= 1; --index) out.push_back(in[index]);
+          +  out.insert(out.end(), in.begin(), in.end());
+          +  for (size_t index = 1; index <= pad; ++index) out.push_back(in[n - 1 - index]);
+          +  return out;
+          +}
+          +
+          +}  // namespace
+          +
+          +float VocalMask(float target_magnitude, float mix_magnitude) {
+          +  // A bin with no energy has no vocal to keep, and dividing by it would turn
+          +  // quantisation noise in the model's output into a full-scale mask.
+          +  if (mix_magnitude <= 1e-6f) return 0.0f;
+          +  return std::min(1.0f, std::max(0.0f, target_magnitude / mix_magnitude));
+          +}
+          +
+          +std::vector<std::vector<float>> ExtractVocals(
+          +  const std::vector<std::vector<float>>& channels,
+          +  const float* target,
+          +  size_t target_stride
+          +) {
+          +  constexpr size_t kFft = kVocalSpectrogramFft;
+          +  constexpr size_t kHop = kVocalSpectrogramHop;
+          +  constexpr size_t kBins = kVocalSpectrogramBins;
+          +  constexpr size_t kPad = kFft / 2;
+          +
+          +  if (target == nullptr) return {};
+          +  if (channels.size() != kVocalSpectrogramChannels) return {};
+          +  const size_t length = channels.front().size();
+          +  if (channels[1].size() != length) return {};
+          +  if (length <= kPad + 1) return {};
+          +
+          +  const size_t padded_length = length + 2 * kPad;
+          +  const size_t frames = (padded_length - kFft) / kHop + 1;
+          +  // The model's output carries at least the frames the input produced.
+          +  if (frames > target_stride) return {};
+          +
+          +  const auto window = HannWindow(kFft);
+          +  std::vector<std::vector<float>> vocals(kVocalSpectrogramChannels);
+          +  std::vector<Complex> spectrum(kFft);
+          +
+          +  for (size_t channel = 0; channel < kVocalSpectrogramChannels; ++channel) {
+          +    const std::vector<float> padded = ReflectPad(channels[channel], kPad);
+          +    // Overlap-add accumulators: the signal, and the squared window it was
+          +    // weighted by, so the edges (where fewer frames overlap) still come out at
+          +    // the right level.
+          +    std::vector<double> signal(padded_length, 0.0);
+          +    std::vector<double> weight(padded_length, 0.0);
+          +    const size_t channel_base = channel * kBins * target_stride;
+          +
+          +    for (size_t frame = 0; frame < frames; ++frame) {
+          +      const size_t start = frame * kHop;
+          +      for (size_t index = 0; index < kFft; ++index) {
+          +        spectrum[index] = Complex(padded[start + index] * window[index], 0.0);
+          +      }
+          +      Fft(spectrum);
+          +
+          +      // Mask the positive half, mirror it as the conjugate: the vocal of a
+          +      // real signal is real.
+          +      for (size_t bin = 0; bin < kBins; ++bin) {
+          +        const float mix = static_cast<float>(std::abs(spectrum[bin]));
+          +        const float estimate = target[channel_base + bin * target_stride + frame];
+          +        spectrum[bin] *= static_cast<double>(VocalMask(estimate, mix));
+          +      }
+          +      for (size_t bin = 1; bin < kFft / 2; ++bin) {
+          +        spectrum[kFft - bin] = std::conj(spectrum[bin]);
+          +      }
+          +
+          +      // Inverse FFT through the forward one: ifft(x) = conj(fft(conj(x))) / n.
+          +      for (auto& value : spectrum) value = std::conj(value);
+          +      Fft(spectrum);
+          +
+          +      for (size_t index = 0; index < kFft; ++index) {
+          +        const double sample = std::conj(spectrum[index]).real() / static_cast<double>(kFft);
+          +        signal[start + index] += sample * window[index];
+          +        weight[start + index] += window[index] * window[index];
+          +      }
+          +    }
+          +
+          +    auto& out = vocals[channel];
+          +    out.resize(length);
+          +    for (size_t index = 0; index < length; ++index) {
+          +      const double w = weight[kPad + index];
+          +      out[index] = w > 1e-8 ? static_cast<float>(signal[kPad + index] / w) : 0.0f;
+          +    }
+          +  }
+          +  return vocals;
+          +}
+          +
+          +}  // namespace bitchord::smart
+          diff --git a/native/analyzer/tests/stem_separation_test.cpp b/native/analyzer/tests/stem_separation_test.cpp
+          new file mode 100644
+          --- /dev/null
+          +++ b/native/analyzer/tests/stem_separation_test.cpp
+          @@ -0,0 +1,92 @@
+          +// Host self-test for the stem separation core (no Android, no model needed).
+          +//
+          +//   g++ -std=c++17 -O2 -I native native/analyzer/tests/stem_separation_test.cpp
+          +//       native/analyzer/stem_separation.cpp native/analyzer/vocal_spectrogram.cpp
+          +//       -o stem_test && ./stem_test  (one command; wrapped here for width)
+          +//
+          +// The properties that make the stems trustworthy whatever the model says:
+          +//   1. a mask of 1 everywhere gives the mix back (the STFT/ISTFT pair is exact),
+          +//   2. a mask of 0 gives silence,
+          +//   3. a flat mask of 0.5 gives exactly half the mix (the mask really scales the signal),
+          +//   4. the model's output being wider than the input (its fixed width) is handled.
+          +
+          +#include <cmath>
+          +#include <cstdio>
+          +#include <vector>
+          +
+          +#include "analyzer/stem_separation.h"
+          +
+          +using namespace bitchord::smart;
+          +
+          +namespace {
+          +
+          +int failures = 0;
+          +
+          +void Check(bool ok, const char* what, double value) {
+          +  std::printf("%s %-58s %.3g\n", ok ? "PASS" : "FAIL", what, value);
+          +  if (!ok) ++failures;
+          +}
+          +
+          +double MaxAbsDiff(const std::vector<float>& a, const std::vector<float>& b, float scale) {
+          +  double worst = 0;
+          +  for (size_t i = 0; i < a.size(); ++i) {
+          +    worst = std::max(worst, std::abs(static_cast<double>(a[i]) - scale * static_cast<double>(b[i])));
+          +  }
+          +  return worst;
+          +}
+          +
+          +}  // namespace
+          +
+          +int main() {
+          +  constexpr size_t kLength = 44100 * 5 + 321;  // deliberately not a multiple of the hop
+          +  std::vector<std::vector<float>> mix(2, std::vector<float>(kLength));
+          +  for (size_t i = 0; i < kLength; ++i) {
+          +    const double t = static_cast<double>(i) / 44100.0;
+          +    mix[0][i] = static_cast<float>(0.5 * std::sin(2 * M_PI * 220 * t) + 0.2 * std::sin(2 * M_PI * 3100 * t));
+          +    mix[1][i] = static_cast<float>(0.4 * std::sin(2 * M_PI * 330 * t) + 0.1 * std::sin(2 * M_PI * 90 * t));
+          +  }
+          +
+          +  const VocalSpectrogram spectrogram = ComputeVocalSpectrogram(mix, kVocalSpectrogramSampleRate);
+          +  Check(spectrogram.frames > 0, "front end produced frames", static_cast<double>(spectrogram.frames));
+          +  const size_t frames = spectrogram.frames;
+          +  const size_t stride = frames + 37;  // the model is wider than the input
+          +  const size_t cells = kVocalSpectrogramChannels * kVocalSpectrogramBins;
+          +
+          +  auto target = [&](float factor) {
+          +    std::vector<float> t(cells * stride, 0.0f);
+          +    for (size_t row = 0; row < cells; ++row) {
+          +      for (size_t f = 0; f < frames; ++f) t[row * stride + f] = factor * spectrogram.values[row * frames + f];
+          +    }
+          +    return t;
+          +  };
+          +
+          +  {
+          +    const auto t = target(10.0f);  // far above the mix: clamped to a mask of 1
+          +    const auto out = ExtractVocals(mix, t.data(), stride);
+          +    Check(out.size() == 2 && out[0].size() == kLength, "output is planar stereo, input length", static_cast<double>(out.size()));
+          +    Check(out.size() == 2 && MaxAbsDiff(out[0], mix[0], 1.0f) < 1e-4, "mask 1 reproduces the left channel", out.empty() ? -1 : MaxAbsDiff(out[0], mix[0], 1.0f));
+          +    Check(out.size() == 2 && MaxAbsDiff(out[1], mix[1], 1.0f) < 1e-4, "mask 1 reproduces the right channel", out.empty() ? -1 : MaxAbsDiff(out[1], mix[1], 1.0f));
+          +  }
+          +  {
+          +    const auto t = target(0.0f);
+          +    const auto out = ExtractVocals(mix, t.data(), stride);
+          +    Check(out.size() == 2 && MaxAbsDiff(out[0], mix[0], 0.0f) < 1e-7, "mask 0 is silence", out.empty() ? -1 : MaxAbsDiff(out[0], mix[0], 0.0f));
+          +  }
+          +  {
+          +    const auto t = target(0.5f);
+          +    const auto out = ExtractVocals(mix, t.data(), stride);
+          +    Check(out.size() == 2 && MaxAbsDiff(out[0], mix[0], 0.5f) < 1e-4, "mask 0.5 gives half the mix", out.empty() ? -1 : MaxAbsDiff(out[0], mix[0], 0.5f));
+          +  }
+          +  {
+          +    const auto t = target(1.0f);
+          +    Check(ExtractVocals(mix, t.data(), frames - 1).empty(), "a model narrower than the input is refused", 0);
+          +    std::vector<std::vector<float>> mono(1, mix[0]);
+          +    Check(ExtractVocals(mono, t.data(), stride).empty(), "mono input is refused", 0);
+          +  }
+          +  Check(VocalMask(0.3f, 0.6f) == 0.5f, "VocalMask is the ratio", VocalMask(0.3f, 0.6f));
+          +  Check(VocalMask(5.0f, 0.6f) == 1.0f, "VocalMask clamps above 1", VocalMask(5.0f, 0.6f));
+          +  Check(VocalMask(0.3f, 0.0f) == 0.0f, "VocalMask of a silent bin is 0", VocalMask(0.3f, 0.0f));
+          +
+          +  std::printf(failures == 0 ? "all passed\n" : "%d FAILED\n", failures);
+          +  return failures == 0 ? 0 : 1;
+          +}
+          diff --git a/app/src/main/cpp/jni/stem_jni.cpp b/app/src/main/cpp/jni/stem_jni.cpp
+          new file mode 100644
+          --- /dev/null
+          +++ b/app/src/main/cpp/jni/stem_jni.cpp
+          @@ -0,0 +1,59 @@
+          +// JNI bridge to the stem-separation back end: the vocals magnitude the
+          +// open-unmix model produced, turned into a vocal signal.
+          +
+          +#include <jni.h>
+          +
+          +#include <vector>
+          +
+          +#include "analyzer/stem_separation.h"
+          +
+          +extern "C" {
+          +
+          +// `target` is the model's output tensor as a *direct* FloatBuffer laid out
+          +// [channel][bin][stride]; `stride` is the model's fixed frame width. Returns
+          +// the vocals as one array, the left channel then the right (planar), or null
+          +// when the buffer is not direct, is too small, or the input does not fit.
+          +JNIEXPORT jfloatArray JNICALL
+          +Java_com_music_bitchord_playback_smart_StemSeparation_nativeExtractVocals(
+          +    JNIEnv* env,
+          +    jclass /* clazz */,
+          +    jfloatArray left,
+          +    jfloatArray right,
+          +    jobject target,
+          +    jint stride) {
+          +  if (left == nullptr || right == nullptr || target == nullptr || stride <= 0) return nullptr;
+          +
+          +  const jsize left_count = env->GetArrayLength(left);
+          +  const jsize right_count = env->GetArrayLength(right);
+          +  if (left_count <= 0 || left_count != right_count) return nullptr;
+          +
+          +  const void* address = env->GetDirectBufferAddress(target);
+          +  if (address == nullptr) return nullptr;
+          +  const jlong capacity = env->GetDirectBufferCapacity(target);
+          +  const jlong needed_floats = static_cast<jlong>(bitchord::smart::kVocalSpectrogramChannels) *
+          +                              static_cast<jlong>(bitchord::smart::kVocalSpectrogramBins) *
+          +                              static_cast<jlong>(stride);
+          +  // A VM may report a direct buffer's capacity in elements or in bytes; a
+          +  // correctly sized buffer is at least this many of either, so a smaller one is
+          +  // refused. The exact size is the caller's contract.
+          +  if (capacity < needed_floats) return nullptr;
+          +
+          +  std::vector<std::vector<float>> channels(2);
+          +  channels[0].resize(static_cast<size_t>(left_count));
+          +  channels[1].resize(static_cast<size_t>(right_count));
+          +  env->GetFloatArrayRegion(left, 0, left_count, channels[0].data());
+          +  env->GetFloatArrayRegion(right, 0, right_count, channels[1].data());
+          +
+          +  const std::vector<std::vector<float>> vocals = bitchord::smart::ExtractVocals(
+          +      channels, static_cast<const float*>(address), static_cast<size_t>(stride));
+          +  if (vocals.size() != 2 || vocals[0].size() != static_cast<size_t>(left_count)) return nullptr;
+          +
+          +  const jsize total = left_count * 2;
+          +  jfloatArray result = env->NewFloatArray(total);
+          +  if (result == nullptr) return nullptr;
+          +  env->SetFloatArrayRegion(result, 0, left_count, vocals[0].data());
+          +  env->SetFloatArrayRegion(result, left_count, left_count, vocals[1].data());
+          +  return result;
+          +}
+          +
+          +}  // extern "C"
+          diff --git a/app/src/main/cpp/CMakeLists.txt b/app/src/main/cpp/CMakeLists.txt
+          --- a/app/src/main/cpp/CMakeLists.txt
+          +++ b/app/src/main/cpp/CMakeLists.txt
+          @@ -4,7 +4,9 @@
+           # autocorrelation, no ML model). Phase 2 adds the log-mel front end the
+           # Beat This! ONNX beat/downbeat model reads (mel_spectrogram.cpp / mel_jni.cpp).
+           # Phase 3 adds the linear-frequency STFT the open-unmix vocal-separation model
+          -# reads (vocal_spectrogram.cpp / vocal_jni.cpp). Both models themselves run
+          +# reads (vocal_spectrogram.cpp / vocal_jni.cpp); stem_separation.cpp turns that
+          +# model's vocal estimate back into audio (vocals, and mix - vocals as the
+          +# instrumental). Both models themselves run
+           # through ONNX Runtime on the Kotlin side, not here. The shared analyzer
+           # sources live under the repo's root `native/` tree rather than here, so a
+           # later phase adding a Rubber Band-based transition renderer can add sources
+          @@ -26,9 +28,11 @@
+               ${BITCHORD_NATIVE_DIR}/analyzer/resampler.cpp
+               ${BITCHORD_NATIVE_DIR}/analyzer/mel_spectrogram.cpp
+               ${BITCHORD_NATIVE_DIR}/analyzer/vocal_spectrogram.cpp
+          +    ${BITCHORD_NATIVE_DIR}/analyzer/stem_separation.cpp
+               jni/analysis_jni.cpp
+               jni/mel_jni.cpp
+               jni/vocal_jni.cpp
+          +    jni/stem_jni.cpp
+           )
+           
+           target_include_directories(bitchord_analysis PRIVATE
+          diff --git a/shared/src/jvmSharedMain/kotlin/com/music/bitchord/playback/smart/VocalTracker.kt b/shared/src/jvmSharedMain/kotlin/com/music/bitchord/playback/smart/VocalTracker.kt
+          --- a/shared/src/jvmSharedMain/kotlin/com/music/bitchord/playback/smart/VocalTracker.kt
+          +++ b/shared/src/jvmSharedMain/kotlin/com/music/bitchord/playback/smart/VocalTracker.kt
+          @@ -76,6 +76,58 @@
+           }
+           
+           /**
+          + * Planar stereo stems of one stretch of a song, all at [rate].
+          + *
+          + * [instrumental] is the mix minus [vocals], sample for sample, so the two always add back to the
+          + * original; there is no second model whose guess could disagree with the first.
+          + */
+          +class StemSet(
+          +    val vocalsLeft: FloatArray,
+          +    val vocalsRight: FloatArray,
+          +    val instrumentalLeft: FloatArray,
+          +    val instrumentalRight: FloatArray,
+          +    val rate: Double,
+          +) {
+          +    val size: Int get() = vocalsLeft.size
+          +}
+          +
+          +/** Turns the open-unmix vocal estimate (a magnitude) into audio: mask the mix's STFT, invert it. */
+          +object StemSeparation {
+          +    val available: Boolean get() = VocalSpectrogram.available
+          +
+          +    /**
+          +     * The vocals for planar stereo [left] / [right] at [VocalSpectrogram.sampleRate], from the
+          +     * model's output [target] (`[2, bins, stride]`, bin-major). Returns the left channel followed
+          +     * by the right in one array, or null when it cannot be done.
+          +     */
+          +    fun extractVocals(left: FloatArray, right: FloatArray, target: FloatBuffer, stride: Int): FloatArray? {
+          +        if (!available || left.isEmpty() || left.size != right.size || stride <= 0) return null
+          +        val direct = if (target.isDirect) target else copyToDirect(target)
+          +        return nativeExtractVocals(left, right, direct, stride)
+          +    }
+          +
+          +    /**
+          +     * Only relative puts and asFloatBuffer(), for the same reason [VocalTracker] avoids
+          +     * position(int): they have existed since API 1.
+          +     */
+          +    private fun copyToDirect(source: FloatBuffer): FloatBuffer {
+          +        val copy = ByteBuffer
+          +            .allocateDirect(source.remaining() * Float.SIZE_BYTES)
+          +            .order(ByteOrder.nativeOrder())
+          +            .asFloatBuffer()
+          +        copy.put(source.duplicate())
+          +        return copy
+          +    }
+          +
+          +    @JvmStatic private external fun nativeExtractVocals(
+          +        left: FloatArray,
+          +        right: FloatArray,
+          +        target: FloatBuffer,
+          +        stride: Int,
+          +    ): FloatArray?
+          +}
+          +
+          +/**
+            * Vocal-presence tracking with open-unmix's "vocals" target (Stöter & Liutkus, Inria/SigSep).
+            *
+            * The transition policy uses this to avoid mixing two vocals over each other: a blend where both
+          @@ -193,6 +245,64 @@
+               }
+           
+               /**
+          +     * Splits one window of a song into vocals and instrumental.
+          +     *
+          +     * The same model run as [track], but instead of reducing the estimate to a presence curve it
+          +     * is kept whole and used as a ratio mask over the mix's own STFT, so what comes back is audio.
+          +     * The result is at [VocalSpectrogram.sampleRate], whatever [rate] the input was at.
+          +     *
+          +     * Bounded like [track]: one model window (~22.8 s), because a transition never needs more.
+          +     * Null when the library or the model is missing, or the window is too long.
+          +     */
+          +    fun separate(left: FloatArray, right: FloatArray, rate: Double): StemSet? {
+          +        if (!VocalSpectrogram.available || !StemSeparation.available) return null
+          +        val mixLeft = MelSpectrogram.resample(left, rate, VocalSpectrogram.sampleRate) ?: return null
+          +        val mixRight = MelSpectrogram.resample(right, rate, VocalSpectrogram.sampleRate) ?: return null
+          +
+          +        val started = System.currentTimeMillis()
+          +        val spectrogram = VocalSpectrogram.compute(mixLeft, mixRight) ?: return null
+          +        if (spectrogram.frames > FIXED_FRAMES) {
+          +            AnalysisLog.warn("Window of ${spectrogram.frames} frames exceeds the model's $FIXED_FRAMES")
+          +            return null
+          +        }
+          +        val active = session() ?: return null
+          +
+          +        return runCatching {
+          +            val bins = spectrogram.bins
+          +            val backing = ByteBuffer
+          +                .allocateDirect(VocalSpectrogram.CHANNELS * bins * FIXED_FRAMES * Float.SIZE_BYTES)
+          +                .order(ByteOrder.nativeOrder())
+          +            fillFixedFrames(backing.asFloatBuffer(), spectrogram.values, bins, spectrogram.frames)
+          +            val environment = OrtEnvironment.getEnvironment()
+          +            val shape = longArrayOf(1, VocalSpectrogram.CHANNELS.toLong(), bins.toLong(), FIXED_FRAMES.toLong())
+          +
+          +            OnnxTensor.createTensor(environment, backing.asFloatBuffer(), shape).use { tensor ->
+          +                active.run(mapOf(active.inputNames.first() to tensor)).use { outputs ->
+          +                    // The output tensor's memory only lives until this block ends, so the vocals
+          +                    // are taken out of it here and nothing keeps a reference to the buffer.
+          +                    val target = (outputs.get(0) as OnnxTensor).floatBuffer
+          +                    val vocals = StemSeparation.extractVocals(mixLeft, mixRight, target, FIXED_FRAMES)
+          +                    if (vocals == null || vocals.size != mixLeft.size * 2) {
+          +                        null
+          +                    } else {
+          +                        val count = mixLeft.size
+          +                        val vocalsLeft = vocals.copyOfRange(0, count)
+          +                        val vocalsRight = vocals.copyOfRange(count, count * 2)
+          +                        AnalysisLog.warn("stems ${spectrogram.frames} frames in ${System.currentTimeMillis() - started}ms")
+          +                        StemSet(
+          +                            vocalsLeft = vocalsLeft,
+          +                            vocalsRight = vocalsRight,
+          +                            instrumentalLeft = FloatArray(count) { mixLeft[it] - vocalsLeft[it] },
+          +                            instrumentalRight = FloatArray(count) { mixRight[it] - vocalsRight[it] },
+          +                            rate = VocalSpectrogram.sampleRate,
+          +                        )
+          +                    }
+          +                }
+          +            }
+          +        }.onFailure { AnalysisLog.warn("Stem separation failed", it) }.getOrNull()
+          +    }
+          +
+          +    /**
+                * Writes the spectrogram into the model's fixed width, zero-padding each bin's tail.
+                *
+                * The stride changes as well as the length: the source is stored at `frames` per bin and the
+          diff --git a/app/src/main/java/com/music/bitchord/playback/smart/TrackAnalyzer.kt b/app/src/main/java/com/music/bitchord/playback/smart/TrackAnalyzer.kt
+          --- a/app/src/main/java/com/music/bitchord/playback/smart/TrackAnalyzer.kt
+          +++ b/app/src/main/java/com/music/bitchord/playback/smart/TrackAnalyzer.kt
+          @@ -1555,6 +1555,15 @@
+                   return bands
+               }
+           
+          +    /**
+          +     * Splits one decoded window of a song (planar stereo at [rate], at most one model window
+          +     * long) into vocals and instrumental with the same open-unmix model that scores vocal
+          +     * presence. Blocking and CPU-heavy: call it from a worker thread, never the playback or main
+          +     * thread. Null when the native library or the model is unavailable.
+          +     */
+          +    fun separateStems(left: FloatArray, right: FloatArray, rate: Double): StemSet? =
+          +        vocals.separate(left, right, rate)
+          +
+               fun release() {
+                   executor.shutdownNow()
+                   sourceResolutionScope.cancel()
+          PATCH_EOF
+
+      - name: Apply the patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          P="$RUNNER_TEMP/automix-stems.patch"
+          if git apply --reverse --check "$P" 2>/dev/null; then
+            echo "::notice::Patch đã có sẵn trong nhánh này, bỏ qua bước áp."
+            echo "APPLIED=already" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          if ! git apply --check "$P"; then
+            echo "::error::Patch không áp được lên nhánh này (file đã bị sửa khác bản gốc). Chạy trên bản main gốc, hoặc gỡ các thay đổi xung đột."
+            exit 1
+          fi
+          git apply "$P"
+          echo "APPLIED=yes" >> "$GITHUB_ENV"
+          git apply --stat "$P"
+          {
+            echo "## Automix stem separation"
+            echo
+            echo "Đã áp patch:"
+            echo
+            git diff --stat | sed 's/^/    /'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Commit the patch locally
+        if: ${{ env.APPLIED == 'yes' }}
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- native shared app
+          git commit -m "Automix: separate vocals and instrumental stems with the open-unmix model"
+
+      - name: Native self-test (stem separation core)
+        shell: bash
+        run: |
+          set -euo pipefail
+          g++ -std=c++17 -O2 -Wall -Wextra -I native \
+            native/analyzer/tests/stem_separation_test.cpp \
+            native/analyzer/stem_separation.cpp \
+            native/analyzer/vocal_spectrogram.cpp \
+            -o "$RUNNER_TEMP/stem_test"
+          "$RUNNER_TEMP/stem_test" | tee "$RUNNER_TEMP/stem_test.log"
+          {
+            echo "### Stem separation self-test"
+            echo
+            sed 's/^/    /' "$RUNNER_TEMP/stem_test.log"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Write local.properties
+        run: |
+          echo "LASTFM_API_KEY=" > local.properties
+          echo "LASTFM_SECRET=" >> local.properties
+          echo "LISTEN_TOGETHER_SERVER=" >> local.properties
+
+      - run: chmod +x gradlew
+
+      - name: Shared tests
+        if: ${{ inputs.run_tests }}
+        shell: bash
+        run: |
+          set -o pipefail
+          ./gradlew :shared:jvmTest 2>&1 | tee build.log
+
+      - name: Build the release-like dev APK
+        if: ${{ inputs.build_apk }}
+        shell: bash
+        run: |
+          set -o pipefail
+          ./gradlew assembleDevBenchmark 2>&1 | tee -a build.log
+
+      - name: Upload the arm64 APK
+        if: ${{ inputs.build_apk }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: bitchord-automix-stems-arm64
+          path: app/build/outputs/apk/dev/benchmark/*arm64-v8a*.apk
+          if-no-files-found: error
+
+      - name: Upload the test reports
+        if: ${{ always() && inputs.run_tests }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: shared-test-reports
+          path: shared/build/reports/tests/
+          if-no-files-found: ignore
+
+      - name: Upload the build log
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
+
+      - name: Push the patched code to a branch
+        if: ${{ inputs.push_branch && env.APPLIED == 'yes' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git push --force-with-lease origin "HEAD:refs/heads/${FIX_BRANCH}"
+          echo "Đã đẩy sang nhánh \`${FIX_BRANCH}\`. Mở PR từ nhánh đó vào ${GITHUB_REF_NAME}." >> "$GITHUB_STEP_SUMMARY"
