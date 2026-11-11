@@ -1,0 +1,1788 @@
+name: Bit Dev - Gemini token + chọn AI/Google Dịch (cập nhật thẳng trong app)
+
+# Chạy tay: tab Actions -> chọn workflow này -> Run workflow.
+# Một file duy nhất, KHÔNG commit gì vào mã nguồn của repo.
+#
+# KẾT QUẢ: KHÔNG có file APK để tải ở Artifacts (mặc định). Workflow build xong sẽ đăng bản mới lên mục Releases của
+# repo micdeptrai-bit/Bit-dev; app Bit Dev đang cài tự phát hiện bản mới lúc mở app và tải + cài NGAY TRONG APP.
+# (Android luôn hiện hộp thoại "Cài đặt" của hệ thống để bạn bấm xác nhận, không app nào cài ngầm được.)
+#
+# KHÔNG BAO GIỜ ĐẺ THÊM APP MỚI: giữ nguyên package com.bit.dev, cùng khoá ký, versionCode luôn lớn hơn mọi bản đã
+# đăng. Trước khi đăng có bước kiểm tra tự động: APK mới phải cùng package, cùng chữ ký và versionCode cao hơn bản
+# trước trên Releases, sai một trong ba là workflow DỪNG, không đăng.
+#
+# THÊM TÍNH NĂNG (trên nền "Gemini dịch lời sang tiếng Việt - prompt dịch giả v3"):
+#   1. Cài đặt, Dịch lời bằng Gemini: xem token đã dùng (hôm nay / tổng / lần gần nhất, vào + ra), đặt giới hạn
+#      token mỗi ngày (0 = không giới hạn), nút đặt lại bộ đếm. Số liệu app tự cộng từ usageMetadata của Gemini;
+#      hạn mức thật do Google quy định, API không trả về nên app không hiện được.
+#   2. Chọn cách dịch: công tắc "Dịch bằng AI (Gemini)". Bật = AI dịch. Tắt = chỉ Google Dịch.
+#   3. AI lỗi (hết hạn mức, mã sai, mất mạng, hết giới hạn ngày) thì KHÔNG tự đổi sang Google Dịch nữa: hiện một
+#      nút "Dịch bằng Google Dịch" riêng ở đầu phần lời, bạn bấm mới dịch. Bấm nút dịch thường để thử lại AI.
+#   4. Automix hết "tua nhanh": bài sắp vào chỉ được đổi tốc độ tối đa tempo_percent % (mặc định 4%, gốc là -10% đến
+#      +25% rồi hạ dần về 1x nên nghe như nhạc chạy nhanh). Cặp bài lệch BPM nhiều hơn thì không beatmatch nữa, dùng
+#      kiểu mix lọc/crossfade có sẵn.
+#
+# CẦN CÓ trong .github/workflows: "automix-manual-mix (2).yml" và "automix-all-in-one (2).yml" (đúng tên, hoặc đổi ở input).
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_file:
+        description: "Workflow chứa phần Gemini cần dựng lại (trong .github/workflows)"
+        type: string
+        default: "automix-manual-mix (2).yml"
+      chain_file:
+        description: "Workflow all-in-one mà base_file cần (trong .github/workflows)"
+        type: string
+        default: "automix-all-in-one (2).yml"
+      skip_base:
+        description: "Bỏ qua bước dựng lại nền (chỉ bật khi repo đã chứa sẵn phần Gemini)"
+        type: boolean
+        default: false
+      use_search:
+        description: "Tra cứu bài hát bằng Google Search trước khi dịch (chính xác hơn nhưng chậm hơn, tốn quota). Tắt = nhanh hơn"
+        type: boolean
+        default: false
+      publish_release:
+        description: "Đăng lên Releases để app đang cài tự cập nhật trong app (MẶC ĐỊNH BẬT). Đừng tắt trừ khi chỉ muốn thử build"
+        type: boolean
+        default: true
+      keep_apk_artifact:
+        description: "Ngoài ra còn giữ thêm file APK ở Artifacts (MẶC ĐỊNH TẮT: không xuất file APK)"
+        type: boolean
+        default: false
+      tempo_percent:
+        description: "Automix chỉ được đổi tốc độ bài sắp vào tối đa bao nhiêu % (mặc định 4; 0 = gần như tắt hẳn; tối đa 10). Gốc là -10% đến +25%, nghe như tua nhanh"
+        type: string
+        default: "4"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: bit-dev-gemini-update-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gemini-vi:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      BIT_DEV_BUILD: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: gradle
+
+      - name: Rebuild the base (all-in-one + Gemini translation)
+        if: ${{ !inputs.skip_base }}
+        shell: bash
+        env:
+          BASE_FILE: ${{ inputs.base_file }}
+          CHAIN_FILE: ${{ inputs.chain_file }}
+        run: |
+          set -euo pipefail
+          LT=shared/src/jvmSharedMain/kotlin/com/music/bitchord/data/lyrics/LyricsTranslation.kt
+          if grep -q "GEMINI_ENDPOINT" "$LT"; then
+            echo "Repo đã có Gemini trong LyricsTranslation.kt, bỏ qua bước dựng lại."
+            exit 0
+          fi
+          cat > "$RUNNER_TEMP/replay_base.py" <<'REPLAY_EOF'
+          import os, re, subprocess, sys
+
+          try:
+              import yaml
+          except ImportError:
+              subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "--break-system-packages", "pyyaml"])
+              import yaml
+
+          name = os.environ["BASE_FILE"]
+          chain = os.environ["CHAIN_FILE"]
+          path = os.path.join(".github", "workflows", name)
+          if not os.path.isfile(path):
+              sys.exit(f"::error::Không thấy .github/workflows/{name}. Workflow này cần file đó để có sẵn phần Gemini (hoặc nhập đúng tên ở input base_file).")
+
+          doc = yaml.safe_load(open(path, encoding="utf8"))
+          steps = next(iter(doc["jobs"].values()))["steps"]
+          first = next((i for i, s in enumerate(steps) if s.get("name") == "Rebuild the all-in-one features"), None)
+          last = next((i for i, s in enumerate(steps) if s.get("name") == "Commit the patch locally"), None)
+          if first is None or last is None or last <= first:
+              sys.exit(f"::error::{name} không có cấu trúc như mong đợi (bước 'Rebuild the all-in-one features' ... 'Commit the patch locally'). Gửi lại file đó để mình chỉnh.")
+
+          EXPR = "$" + "{{"
+          CHAIN_RE = re.compile(r"\$\{\{\s*inputs\.chain_file\s*\}\}")
+          OTHER_RE = re.compile(r"\$\{\{\s*inputs\.\w+(\s*&&\s*inputs\.\w+)*\s*\}\}")
+
+          todo = [s for s in steps[first:last] if s.get("run")]
+          print(f"Dựng lại {len(todo)} bước từ {name}")
+          for s in todo:
+              run = CHAIN_RE.sub(lambda m: chain, s["run"])
+              run = OTHER_RE.sub("true", run)
+              if EXPR in run:
+                  sys.exit(f"::error::Bước '{s.get('name')}' còn biểu thức GitHub chưa xử lý được.")
+              env = dict(os.environ)
+              for k, v in (s.get("env") or {}).items():
+                  env[k] = CHAIN_RE.sub(lambda m: chain, str(v))
+              print(f"::group::{s.get('name')}", flush=True)
+              r = subprocess.run(["bash", "-eo", "pipefail", "-c", run], env=env)
+              print("::endgroup::", flush=True)
+              if r.returncode != 0:
+                  sys.exit(f"::error::Bước '{s.get('name')}' của {name} lỗi (mã {r.returncode}).")
+          print("Đã dựng xong bản nền (all-in-one + Gemini).")
+
+          REPLAY_EOF
+          python3 "$RUNNER_TEMP/replay_base.py"
+
+      - name: Apply the Vietnamese lyricist prompt to Gemini (xưng hô nhất quán + lượt rà xưng hô)
+        shell: bash
+        env:
+          USE_SEARCH: ${{ inputs.use_search }}
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/vi_prompt.py" <<'VI_EOF'
+          import os, re, sys
+
+          USE_SEARCH = os.environ.get("USE_SEARCH", "false").strip().lower() == "true"
+
+          PATH = "shared/src/jvmSharedMain/kotlin/com/music/bitchord/data/lyrics/LyricsTranslation.kt"
+          src = open(PATH, encoding="utf8").read()
+
+          if "GEMINI_CONTEXT_INSTRUCTION" in src:
+              print("Bản vá Gemini v2 đã có sẵn, bỏ qua.")
+              sys.exit(0)
+          if "GEMINI_ENDPOINT" not in src or "requestGemini" not in src:
+              sys.exit("::error::LyricsTranslation.kt chưa có phần Gemini (patch automix-manual-mix chưa được áp).")
+
+          BRACES_BEFORE = src.count("{") - src.count("}")
+          PARENS_BEFORE = src.count("(") - src.count(")")
+
+
+          def once(text, old, new, what):
+              n = text.count(old)
+              if n != 1:
+                  sys.exit(f"::error::Không vá được '{what}': tìm thấy {n} chỗ khớp (cần đúng 1). Gửi lại LyricsTranslation.kt để mình chỉnh.")
+              return text.replace(old, new)
+
+
+          def line_bounds(text, needle, what):
+              n = text.count(needle)
+              if n != 1:
+                  sys.exit(f"::error::Không vá được '{what}': tìm thấy {n} chỗ khớp (cần đúng 1).")
+              pos = text.index(needle)
+              start = text.rfind("\n", 0, pos) + 1
+              end = text.index("\n", pos) + 1
+              indent = re.match(r"[ \t]*", text[start:end]).group(0)
+              return start, end, indent
+
+
+          def replace_line(text, needle, lines, what):
+              start, end, indent = line_bounds(text, needle, what)
+              return text[:start] + "".join((indent + l if l else "") + "\n" for l in lines) + text[end:]
+
+
+          def insert_before(text, needle, lines, what):
+              start, _, indent = line_bounds(text, needle, what)
+              return text[:start] + "".join((indent + l if l else "") + "\n" for l in lines) + text[start:]
+
+
+          def insert_after(text, needle, lines, what):
+              _, end, indent = line_bounds(text, needle, what)
+              return text[:end] + "".join((indent + l if l else "") + "\n" for l in lines) + text[end:]
+
+
+          # ---------------------------------------------------------------------------------------------
+          # 1) Hằng số: prompt dịch giả tiếng Việt (v2) + prompt tra cứu bài hát
+          # ---------------------------------------------------------------------------------------------
+          CONSTS = r'''    private const val GEMINI_MAX_CHARS = 7_000
+              private const val GEMINI_CONTEXT_MAX_CHARS = 2_500
+              // Tra cứu bài hát bằng Google Search trước khi dịch: chính xác hơn nhưng chậm hơn và tốn quota (chọn lúc chạy workflow).
+              private const val GEMINI_USE_SEARCH = __USE_SEARCH__
+
+              // Lời dịch giả/lyricist tiếng Việt (dùng khi ngôn ngữ đích là tiếng Việt), bản chú trọng xưng hô nhất quán.
+              // Phần sau là hợp đồng JSON mà app cần (analysis để chốt xưng hô trước, rồi mỗi dòng gốc một dòng dịch).
+              private val GEMINI_VI_INSTRUCTION = """
+                  Bạn là một dịch giả âm nhạc và người viết lời bài hát (lyricist) chuyên nghiệp, cực kỳ kỹ tính về xưng hô và ngữ cảnh. Khi dịch lời bài hát sang tiếng Việt, hãy tuân thủ tuyệt đối các nguyên tắc sau:
+
+                  1. Đọc hiểu và chốt xưng hô TRƯỚC khi dịch
+                  - Đọc toàn bài, nắm câu chuyện, mạch cảm xúc, xác định rõ ai đang hát (giới tính, vai, độ tuổi nếu suy ra được) và hát cho ai (người yêu, người cũ, bạn bè, gia đình, đối thủ, chính mình, đấng thiêng liêng...).
+                  - Nếu có phần GHI CHÚ VỀ BÀI HÁT ở cuối hướng dẫn này, hãy ưu tiên nó khi chốt giới tính, quan hệ và cặp xưng hô. Ghi chú không phải lời bài hát, không được dịch hay đưa vào kết quả.
+                  - Chốt MỘT cặp xưng hô cho mỗi cặp người nói - người nghe, theo đúng quan hệ và sắc thái: ví dụ anh - em, em - anh, tôi - em, tôi - anh, tao - mày, tớ - cậu, mình - bạn, ta - người, ta - em... Không mặc định bài nào cũng là anh - em; không mặc định người hát là nam.
+                  - Nếu lời gốc không lộ giới tính hay quan hệ và ghi chú cũng không nói rõ, chọn cặp phổ biến và tự nhiên nhất của thể loại bài, rồi GIỮ NGUYÊN, không đổi giữa chừng.
+
+                  2. Xưng hô: quy tắc cứng
+                  - Cặp xưng hô đã chốt phải dùng nhất quán ở MỌI dòng. Tuyệt đối không nhảy lung tung giữa tôi, anh, em, mình, tao, tớ, cậu, mày giữa các dòng hay các đoạn.
+                  - Chỉ đổi cặp xưng hô khi bài thật sự đổi người nói hoặc đổi người nghe (đối thoại hai nhân vật, đoạn rap nói với người khác, đoạn tự nhủ). Khi đó phải ghi rõ trong analysis, và trong cùng một đoạn vẫn giữ nhất quán.
+                  - Ngôi thứ ba (he, she, they) dịch đúng giới tính và nhất quán (anh ấy, cô ấy, họ, hắn, nó...). Giữ nhất quán thì (quá khứ, hiện tại, tương lai) và giọng điệu xuyên suốt cả bài.
+                  - Tiếng Việt được phép bỏ chủ ngữ khi nhịp câu cần, nhưng nếu đã dùng đại từ thì phải đúng cặp đã chốt.
+
+                  3. Văn phong bay bổng nhưng đúng ý
+                  - Dịch sát nghĩa và cảm xúc nhưng tuyệt đối không dịch word-by-word gây ngượng ép. Được phép biến tấu từ ngữ, đổi hình ảnh, ẩn dụ sang cách nói tự nhiên và giàu chất thơ của tiếng Việt, tạo nhịp và vần nhẹ khi hợp, miễn là giữ đúng ý, đúng cảm xúc và hợp ngữ cảnh bài. Không bịa thêm tình tiết hay thông tin không có trong lời gốc.
+                  - Chuẩn chất lời bài hát: câu từ ngắn gọn, cô đọng, có nhịp điệu, giàu cảm xúc, không như văn bản hành chính.
+                  - Tiếng lóng và nghĩa đôi: toàn bộ tiếng lóng (slang), từ đường phố, từ chửi thề và câu chữ nghĩa đôi (double entendre) phải được dịch bằng tiếng lóng tiếng Việt tự nhiên có cùng mức độ và sắc thái. Không làm nhẹ từ, không nói giảm nói tránh, không kiểm duyệt.
+                  - Tên riêng và thương hiệu: giữ nguyên 100% như bản gốc.
+
+                  4. Tự soát lỗi trước khi trả lời
+                  - Đọc lại toàn bộ các dòng đã dịch. Chỗ nào xưng hô lệch khỏi cặp đã chốt, hoặc sai giới tính, hoặc sai thì, thì sửa ngay.
+                  - Đầu ra chỉ gồm lời bài hát đã dịch, không thêm lời giải thích hay mở đầu nào.
+              """.trimIndent() + "\n\n" + """
+                  Định dạng bắt buộc của ứng dụng: người dùng gửi một mảng JSON, mỗi phần tử là một dòng lời bài hát. Hãy trả về một đối tượng JSON gồm bốn trường theo đúng thứ tự: "analysis", "pair", "source", "lines".
+                  - "analysis": viết TRƯỚC, bằng tiếng Việt, tối đa khoảng 80 từ, ghi: người hát là ai (giới tính, vai), hát cho ai và quan hệ giữa hai bên, cặp xưng hô đã chốt cho cả bài và lý do ngắn, các đoạn đổi người nói hoặc đổi đối tượng kèm cặp xưng hô riêng (nếu có), thì chủ đạo. Phần này chỉ để bạn chốt xưng hô, đừng đưa nó vào "lines".
+                  - "pair": đúng MỘT cặp xưng hô chủ đạo của cả bài, dạng "người hát tự xưng - gọi người nghe", ví dụ "anh - em" hoặc "tao - mày". Mọi dòng trong "lines" phải bám cặp này (trừ đoạn đổi người nói đã nêu trong "analysis").
+                  - "source": mã ISO 639-1 của ngôn ngữ mà bài hát chủ yếu được hát (bỏ qua các dòng ngoại ngữ xen vào).
+                  - "lines": mảng các chuỗi đã dịch, bám đúng "analysis". Đúng một chuỗi cho mỗi dòng đầu vào, cùng thứ tự, tuyệt đối không gộp, tách, bỏ hay thêm dòng, không để dòng nào trống.
+                  Các dòng hoặc cụm ngôn ngữ khác xen vào bài cũng phải được dịch theo đúng các nguyên tắc trên; chỉ giữ nguyên tiếng đệm thuần túy (oh, yeah, la la la) và những dòng vốn đã là tiếng Việt. Các nguyên tắc trên áp dụng cho nội dung từng chuỗi trong "lines"; không thêm lời giải thích hay mở đầu vào chuỗi nào.
+              """.trimIndent()
+
+              // Bước tra cứu (có Google Search) chạy trước khi dịch: ai hát cho ai, câu chuyện, nghĩa tiếng lóng, cặp xưng hô nên dùng.
+              private val GEMINI_CONTEXT_INSTRUCTION = """
+                  Bạn là chuyên gia âm nhạc. Người dùng gửi lời một bài hát. Hãy dùng Google Search để nhận diện bài hát (tên, nghệ sĩ, năm nếu tìm được), tìm câu chuyện, bối cảnh, ý nghĩa, nhân vật, và nghĩa của tiếng lóng hay ẩn dụ khó trong bài. Chỉ tin thông tin tra được hoặc suy ra chắc chắn từ lời; chỗ nào không chắc thì ghi "chưa rõ", không bịa.
+                  Trả lời bằng tiếng Việt, tối đa khoảng 220 từ, gạch đầu dòng ngắn, gồm các mục: Bài hát; Câu chuyện và cảm xúc; Người hát và người nghe (giới tính, quan hệ); Cặp xưng hô tiếng Việt nên dùng (kèm ngoại lệ theo đoạn nếu có); Tiếng lóng, ẩn dụ cần lưu ý (kèm nghĩa).
+                  Không dịch lời bài hát và không chép nguyên văn lời bài hát.
+              """.trimIndent()
+
+              // Lượt rà xưng hô: một lời gọi riêng, chỉ có một việc là bắt và sửa đại từ lệch khỏi cặp đã chốt.
+              private val GEMINI_REVIEW_INSTRUCTION = """
+                  Bạn là biên tập viên chuyên rà xưng hô cho lời bài hát tiếng Việt. Người dùng gửi một đối tượng JSON gồm "plan" (cặp xưng hô đã chốt cùng phân tích), "original" (các dòng gốc) và "translated" (các dòng đã dịch sang tiếng Việt).
+                  Nhiệm vụ DUY NHẤT của bạn: tìm và sửa mọi chỗ trong "translated" xưng hô lệch khỏi "plan". Đại từ tự xưng, đại từ gọi người nghe và ngôi thứ ba phải nhất quán xuyên suốt, đúng giới tính, trừ đoạn mà "plan" nói rõ là đổi người nói hoặc đổi người nghe. Đối chiếu "original" để hiểu dòng đó đang nói về ai, nói với ai.
+                  Giữ nguyên mọi thứ khác: ý nghĩa, nhịp, vần, tiếng lóng, độ thô, từ ngữ. Chỉ sửa tối thiểu những từ cần sửa. Dòng nào đã đúng thì chép lại y nguyên từng chữ.
+                  Trả về JSON dạng {"lines": [...]}: đúng số dòng của "translated", cùng thứ tự, không dòng nào trống, không thêm giải thích.
+              """.trimIndent()
+          '''
+          src = once(src, "    private const val GEMINI_MAX_CHARS = 7_000\n", CONSTS.replace("__USE_SEARCH__", "true" if USE_SEARCH else "false"), "hằng GEMINI_MAX_CHARS")
+
+          # ---------------------------------------------------------------------------------------------
+          # 2) Prompt tiếng Anh cũ vẫn dùng cho ngôn ngữ đích khác; chọn prompt theo ngôn ngữ đích
+          # ---------------------------------------------------------------------------------------------
+          src = once(src, 'val instruction = "You translate song lyrics.', 'val englishInstruction = "You translate song lyrics.', "prompt tiếng Anh")
+
+          m = re.search(r'^([ \t]*)\+?[^\n]*ignoring the mixed-in foreign lines\."\n', src, re.M)
+          if not m or len(re.findall(r'ignoring the mixed-in foreign lines\."\n', src)) != 1:
+              sys.exit("::error::Không tìm thấy cuối prompt tiếng Anh trong requestGemini.")
+          base_ind = re.search(r'^([ \t]*)val englishInstruction', src, re.M).group(1)
+          pick = (
+              base_ind + 'val vietnamese = target.startsWith("vi", ignoreCase = true)\n'
+              + base_ind + 'val instruction = if (vietnamese) GEMINI_VI_INSTRUCTION else englishInstruction\n'
+              + base_ind + '// Tiếng Việt: buộc Gemini chốt xưng hô vào trường "analysis" trước khi viết các dòng dịch.\n'
+              + base_ind + 'val planFirst = vietnamese\n'
+          )
+          src = src[:m.end()] + pick + src[m.end():]
+
+          # Ghi chú tra cứu được nối vào system instruction.
+          src = once(src, 'put("text", instruction)', 'put("text", withSongNotes(instruction, context))', "systemInstruction")
+
+          # requestGemini nhận thêm ghi chú bài hát (mặc định null).
+          rg = re.compile(r"(private suspend fun requestGemini\(\n(?P<i>[ \t]*)slots: List<TextSlot>,\n[ \t]*target: String,\n[ \t]*settings: GeminiSettings,\n)")
+          mm = rg.search(src)
+          if not mm or len(rg.findall(src)) != 1:
+              sys.exit("::error::Không tìm thấy chữ ký hàm requestGemini để thêm tham số ghi chú.")
+          src = src[:mm.end()] + mm.group("i") + "context: String? = null,\n" + src[mm.end():]
+
+          # ---------------------------------------------------------------------------------------------
+          # 3) Schema: thêm "analysis" (đứng đầu) khi dịch tiếng Việt
+          # ---------------------------------------------------------------------------------------------
+          src = insert_after(src, 'putJsonObject("properties") {', [
+              '    if (planFirst) putJsonObject("analysis") { put("type", "STRING") }',
+              '    if (planFirst) putJsonObject("pair") { put("type", "STRING") }',
+          ], 'schema properties')
+          # "required" trước (khi 'add(JsonPrimitive("source"))' còn duy nhất), rồi mới chèn propertyOrdering.
+          src = insert_before(src, 'add(JsonPrimitive("source"))', [
+              'if (planFirst) add(JsonPrimitive("analysis"))',
+              'if (planFirst) add(JsonPrimitive("pair"))',
+          ], 'required analysis')
+          src = insert_before(src, 'putJsonArray("required") {', [
+              'if (planFirst) putJsonArray("propertyOrdering") {',
+              '    add(JsonPrimitive("analysis"))',
+              '    add(JsonPrimitive("pair"))',
+              '    add(JsonPrimitive("source"))',
+              '    add(JsonPrimitive("lines"))',
+              '}',
+          ], 'propertyOrdering')
+
+          # ---------------------------------------------------------------------------------------------
+          # 4) temperature, safetySettings
+          # ---------------------------------------------------------------------------------------------
+          src = once(src, 'put("temperature", 0.3)', 'put("temperature", 0.4)', "temperature")
+
+          gm = re.findall(r'^([ \t]*)putJsonObject\("generationConfig"\) \{\n', src, re.M)
+          if len(gm) != 1:
+              sys.exit(f"::error::Không vá được 'generationConfig': tìm thấy {len(gm)} chỗ (cần đúng 1).")
+          i = gm[0]
+          SAFETY = (
+              f'{i}putJsonArray("safetySettings") {{\n'
+              f'{i}    // Lời bài hát đầy tiếng lóng, chửi thề và nghĩa đôi: không để bộ lọc của Gemini chặn.\n'
+              f'{i}    listOf(\n'
+              f'{i}        "HARM_CATEGORY_HARASSMENT",\n'
+              f'{i}        "HARM_CATEGORY_HATE_SPEECH",\n'
+              f'{i}        "HARM_CATEGORY_SEXUALLY_EXPLICIT",\n'
+              f'{i}        "HARM_CATEGORY_DANGEROUS_CONTENT",\n'
+              f'{i}    ).forEach {{ category ->\n'
+              f'{i}        addJsonObject {{\n'
+              f'{i}            put("category", category)\n'
+              f'{i}            put("threshold", "BLOCK_NONE")\n'
+              f'{i}        }}\n'
+              f'{i}    }}\n'
+              f'{i}}}\n'
+          )
+          anchor = f'{i}putJsonObject("generationConfig") {{\n'
+          src = once(src, anchor, SAFETY + anchor, "generationConfig")
+
+          # ---------------------------------------------------------------------------------------------
+          # 5) Timeout dài hơn. Http.client có readTimeout 30 giây: Gemini chỉ trả về khi viết xong cả bài,
+          #    nên phải nâng cả readTimeout chứ không chỉ callTimeout.
+          # ---------------------------------------------------------------------------------------------
+          src = once(
+              src,
+              ".callTimeout(45, TimeUnit.SECONDS)\n",
+              ".callTimeout(150, TimeUnit.SECONDS)\n            .readTimeout(150, TimeUnit.SECONDS)\n",
+              "callTimeout Gemini",
+          )
+          src = once(src, ".connectTimeout(8, TimeUnit.SECONDS)\n", ".connectTimeout(10, TimeUnit.SECONDS)\n", "connectTimeout Gemini")
+          src = insert_before(src, "private val client by lazy {", [
+              "// Bước tra cứu bài hát (Google Search) cũng cần thời gian; hết giờ thì dịch tiếp không có ghi chú.",
+              "private val geminiContextClient by lazy {",
+              "    geminiClient.newBuilder()",
+              "        .callTimeout(75, TimeUnit.SECONDS)",
+              "        .readTimeout(75, TimeUnit.SECONDS)",
+              "        .build()",
+              "}",
+              "// Lượt rà xưng hô ngắn hơn lượt dịch; hết giờ thì giữ bản dịch đầu.",
+              "private val geminiReviewClient by lazy {",
+              "    geminiClient.newBuilder()",
+              "        .callTimeout(60, TimeUnit.SECONDS)",
+              "        .readTimeout(60, TimeUnit.SECONDS)",
+              "        .build()",
+              "}",
+          ], "client Google")
+
+          # ---------------------------------------------------------------------------------------------
+          # 6) Tra cứu bài hát một lần cho cả bài (mọi đoạn chia nhỏ dùng chung một ghi chú, nên xưng hô khớp nhau)
+          # ---------------------------------------------------------------------------------------------
+          src = insert_before(src, "val texts = mutableListOf<String>()", [
+              "// Chỉ tiếng Việt cần chốt xưng hô. Tra cứu (nếu bật) chạy một lần, dùng chung cho mọi đoạn; lỗi hay hết giờ thì dịch không có ghi chú.",
+              'val vietnamese = target.startsWith("vi", ignoreCase = true)',
+              "val context = if (GEMINI_USE_SEARCH && vietnamese) researchSong(slots, settings) else null",
+              "var carried = context",
+          ], "researchSong call")
+          src = replace_line(src, "val answer = requestGemini(chunk, target, settings) ?: return null", [
+              "val first = requestGemini(chunk, target, settings, carried) ?: return null",
+              "// Tiếng Việt: một lượt rà riêng chỉ để bắt lỗi xưng hô. Lỗi hay lệch số dòng thì giữ bản dịch đầu.",
+              "val answer = if (vietnamese && first.plan.isNotBlank()) {",
+              "    reviewPronouns(chunk, first.texts, first.plan, settings)",
+              "        ?.let { GeminiAnswer(it, first.sourceLanguage, first.plan) } ?: first",
+              "} else {",
+              "    first",
+              "}",
+              "// Đoạn sau giữ đúng cặp xưng hô đã chốt ở đoạn trước.",
+              "if (answer.plan.isNotBlank()) {",
+              '    carried = listOfNotNull(context, "XƯNG HÔ ĐÃ CHỐT Ở ĐOẠN TRƯỚC, GIỮ NGUYÊN:\\n" + answer.plan).joinToString("\\n\\n")',
+              "}",
+          ], "gọi requestGemini")
+
+          HELPERS = r'''    /** Ghi chú tra cứu nối vào cuối system instruction; không có ghi chú thì giữ nguyên. */
+              private fun withSongNotes(instruction: String, notes: String?): String =
+                  if (notes.isNullOrBlank()) {
+                      instruction
+                  } else {
+                      instruction + "\n\nGHI CHÚ VỀ BÀI HÁT (đã tra cứu; dùng để chốt xưng hô và hiểu ngữ cảnh, không dịch phần này, không đưa vào kết quả):\n" + notes
+                  }
+
+              /**
+               * Hỏi Gemini (có Google Search) về bài hát trước khi dịch: tên, câu chuyện, ai hát cho ai, nghĩa tiếng lóng,
+               * cặp xưng hô nên dùng. Null khi lỗi hay hết giờ, khi đó vẫn dịch bình thường, chỉ thiếu ghi chú.
+               */
+              private suspend fun researchSong(slots: List<TextSlot>, settings: GeminiSettings): String? {
+                  val lyric = slots.joinToString("\n") { it.text }.take(GEMINI_MAX_CHARS)
+                  val body = buildJsonObject {
+                      putJsonObject("systemInstruction") {
+                          putJsonArray("parts") { addJsonObject { put("text", GEMINI_CONTEXT_INSTRUCTION) } }
+                      }
+                      putJsonArray("contents") {
+                          addJsonObject {
+                              put("role", "user")
+                              putJsonArray("parts") { addJsonObject { put("text", lyric) } }
+                          }
+                      }
+                      putJsonArray("tools") {
+                          addJsonObject { putJsonObject("google_search") {} }
+                      }
+                      putJsonArray("safetySettings") {
+                          listOf(
+                              "HARM_CATEGORY_HARASSMENT",
+                              "HARM_CATEGORY_HATE_SPEECH",
+                              "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+                              "HARM_CATEGORY_DANGEROUS_CONTENT",
+                          ).forEach { category ->
+                              addJsonObject {
+                                  put("category", category)
+                                  put("threshold", "BLOCK_NONE")
+                              }
+                          }
+                      }
+                      putJsonObject("generationConfig") { put("temperature", 0.3) }
+                  }
+                  val request = Request.Builder()
+                      .url("$GEMINI_ENDPOINT${geminiModel(settings)}:generateContent")
+                      .header("x-goog-api-key", settings.apiKey.trim())
+                      .header("User-Agent", "BitChord/1.7.1")
+                      .post(body.toString().toRequestBody("application/json".toMediaType()))
+                      .build()
+                  val response = try {
+                      geminiContextClient.newCall(request).awaitBody()
+                  } catch (cancelled: CancellationException) {
+                      throw cancelled
+                  } catch (_: IOException) {
+                      return null
+                  }
+                  return runCatching {
+                      val root = json.parseToJsonElement(response).jsonObject
+                      root["candidates"]!!.jsonArray[0].jsonObject["content"]!!.jsonObject["parts"]!!.jsonArray
+                          .joinToString("") { it.jsonObject["text"]?.jsonPrimitive?.contentOrNull.orEmpty() }
+                          .trim()
+                          .takeIf { it.isNotEmpty() }
+                          ?.take(GEMINI_CONTEXT_MAX_CHARS)
+                  }.getOrNull()
+              }
+
+          '''
+          REVIEW = r'''    /**
+               * Lượt rà xưng hô: một lời gọi riêng, chỉ có một việc là sửa đại từ lệch khỏi cặp đã chốt. Null khi lỗi hay
+               * lệch số dòng, khi đó giữ bản dịch đầu.
+               */
+              private suspend fun reviewPronouns(
+                  original: List<TextSlot>,
+                  translated: List<String>,
+                  plan: String,
+                  settings: GeminiSettings,
+              ): List<String>? {
+                  val payload = buildJsonObject {
+                      put("plan", plan)
+                      putJsonArray("original") { original.forEach { add(JsonPrimitive(it.text)) } }
+                      putJsonArray("translated") { translated.forEach { add(JsonPrimitive(it)) } }
+                  }
+                  val body = buildJsonObject {
+                      putJsonObject("systemInstruction") {
+                          putJsonArray("parts") { addJsonObject { put("text", GEMINI_REVIEW_INSTRUCTION) } }
+                      }
+                      putJsonArray("contents") {
+                          addJsonObject {
+                              put("role", "user")
+                              putJsonArray("parts") { addJsonObject { put("text", payload.toString()) } }
+                          }
+                      }
+                      putJsonArray("safetySettings") {
+                          listOf(
+                              "HARM_CATEGORY_HARASSMENT",
+                              "HARM_CATEGORY_HATE_SPEECH",
+                              "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+                              "HARM_CATEGORY_DANGEROUS_CONTENT",
+                          ).forEach { category ->
+                              addJsonObject {
+                                  put("category", category)
+                                  put("threshold", "BLOCK_NONE")
+                              }
+                          }
+                      }
+                      putJsonObject("generationConfig") {
+                          put("temperature", 0.1)
+                          put("responseMimeType", "application/json")
+                          putJsonObject("responseSchema") {
+                              put("type", "OBJECT")
+                              putJsonObject("properties") {
+                                  putJsonObject("lines") {
+                                      put("type", "ARRAY")
+                                      putJsonObject("items") { put("type", "STRING") }
+                                  }
+                              }
+                              putJsonArray("required") { add(JsonPrimitive("lines")) }
+                          }
+                      }
+                  }
+                  val request = Request.Builder()
+                      .url("$GEMINI_ENDPOINT${geminiModel(settings)}:generateContent")
+                      .header("x-goog-api-key", settings.apiKey.trim())
+                      .header("User-Agent", "BitChord/1.7.1")
+                      .post(body.toString().toRequestBody("application/json".toMediaType()))
+                      .build()
+                  val response = try {
+                      geminiReviewClient.newCall(request).awaitBody()
+                  } catch (cancelled: CancellationException) {
+                      throw cancelled
+                  } catch (_: IOException) {
+                      return null
+                  }
+                  return runCatching {
+                      val root = json.parseToJsonElement(response).jsonObject
+                      val text = root["candidates"]!!.jsonArray[0].jsonObject["content"]!!.jsonObject["parts"]!!.jsonArray
+                          .joinToString("") { it.jsonObject["text"]?.jsonPrimitive?.contentOrNull.orEmpty() }
+                      val lines = json.parseToJsonElement(text).jsonObject["lines"]!!.jsonArray.map { it.jsonPrimitive.content.trim() }
+                      lines.takeIf { it.size == translated.size && it.none { line -> line.isBlank() } }
+                  }.getOrNull()
+              }
+
+          '''
+          HELPERS = HELPERS + REVIEW
+          helper_lines = [l[4:] if l.startswith("    ") else l for l in HELPERS.rstrip("\n").split("\n")] + [""]
+          src = insert_before(src, "private class GeminiAnswer(", helper_lines, "helpers")
+
+          # ---------------------------------------------------------------------------------------------
+          # 6b) GeminiAnswer mang theo "plan" (cặp xưng hô + phân tích) để lượt rà và các đoạn sau dùng lại
+          # ---------------------------------------------------------------------------------------------
+          src = once(
+              src,
+              "private class GeminiAnswer(val texts: List<String>, val sourceLanguage: String)",
+              "private class GeminiAnswer(val texts: List<String>, val sourceLanguage: String, val plan: String = \"\")",
+              "GeminiAnswer",
+          )
+          src = insert_after(src, 'val source = answer["source"]?.jsonPrimitive?.contentOrNull.orEmpty()', [
+              "val plan = listOfNotNull(",
+              '    answer["pair"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }?.let { "Cặp xưng hô đã chốt: " + it },',
+              '    answer["analysis"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }?.let { "Phân tích: " + it },',
+              ').joinToString("\\n")',
+          ], "đọc plan")
+
+          # ---------------------------------------------------------------------------------------------
+          # 7) Dòng Gemini trả về rỗng: giữ lại dòng gốc thay vì bỏ cả bài rồi rơi về Google Dịch
+          # ---------------------------------------------------------------------------------------------
+          src = once(
+              src,
+              "if (translated.size != slots.size || translated.any { it.isBlank() }) return@runCatching null",
+              "if (translated.size != slots.size) return@runCatching null",
+              "kiểm tra dòng rỗng",
+          )
+          src = once(
+              src,
+              "GeminiAnswer(translated, source)",
+              "GeminiAnswer(translated.mapIndexed { index, text -> text.ifBlank { slots[index].text } }, source, plan)",
+              "dòng rỗng giữ gốc",
+          )
+
+          # ---------------------------------------------------------------------------------------------
+          # 8) Bản dịch cũ trong cache (làm bằng prompt cũ) không còn dùng: tăng phiên bản cache
+          # ---------------------------------------------------------------------------------------------
+          src = once(src, "CACHE_VERSION = 3", "CACHE_VERSION = 4", "CACHE_VERSION")
+
+          # ---------------------------------------------------------------------------------------------
+          # Kiểm tra: ngoặc phải cân bằng như trước, các khối mới phải có mặt
+          # ---------------------------------------------------------------------------------------------
+          if src.count("{") - src.count("}") != BRACES_BEFORE:
+              sys.exit("::error::Sau khi vá, số ngoặc nhọn bị lệch, dừng lại để khỏi build hỏng.")
+          if src.count("(") - src.count(")") != PARENS_BEFORE:
+              sys.exit("::error::Sau khi vá, số ngoặc tròn bị lệch, dừng lại để khỏi build hỏng.")
+          for must in ("withSongNotes(instruction, context)", "researchSong(slots, settings)", "geminiContextClient", "planFirst", "CACHE_VERSION = 4"):
+              if must not in src:
+                  sys.exit(f"::error::Thiếu '{must}' sau khi vá.")
+
+          open(PATH, "w", encoding="utf8").write(src)
+          print("Đã vá LyricsTranslation.kt (v3): xưng hô chốt trước (analysis + pair), lượt rà xưng hô riêng, "
+                "timeout 150s, dòng rỗng giữ gốc, cache v4, temperature 0.4, safetySettings BLOCK_NONE.")
+          VI_EOF
+          python3 "$RUNNER_TEMP/vi_prompt.py"
+          {
+            echo "## Gemini dịch lời: prompt dịch giả tiếng Việt v3"
+            echo
+            echo "- Chốt xưng hô trước (analysis + pair), rồi một lượt rà xưng hô riêng sau khi dịch"
+            echo "- Bài dài chia nhiều đoạn: cặp xưng hô đã chốt ở đoạn trước được truyền sang đoạn sau"
+            echo "- Tra cứu bài hát bằng Google Search: ${USE_SEARCH}"
+            echo "- Timeout dịch 150 giây, rà 60 giây, tra cứu 75 giây"
+            echo "- temperature = 0.4, safetySettings = BLOCK_NONE (4 mục), cache v4"
+            echo
+            git status --short | sed 's/^/    /'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Add token counter, AI/Google choice and the separate Google Translate button
+        run: |
+          cat > "$RUNNER_TEMP/tokens_patch.py" <<'TOKENS_EOF'
+          #!/usr/bin/env python3
+          # Chạy ở thư mục gốc repo, SAU khi bản nền (all-in-one + Gemini v3) đã dựng xong.
+          # Thêm: (1) đếm token Gemini + giới hạn token/ngày, (2) chọn dịch AI hay Google Dịch,
+          #       (3) AI lỗi thì KHÔNG tự quay về Google: hiện một nút "Dịch bằng Google Dịch" riêng trên phần lời.
+          import os
+          import re
+          import sys
+
+          ROOT = os.getcwd()
+
+
+          def path(*parts):
+              return os.path.join(ROOT, *parts)
+
+
+          def read(p):
+              with open(p, encoding="utf8") as f:
+                  return f.read()
+
+
+          def write(p, s):
+              with open(p, "w", encoding="utf8") as f:
+                  f.write(s)
+
+
+          def once(src, old, new, label):
+              n = src.count(old)
+              if n != 1:
+                  sys.exit(f"::error::Vá '{label}': cần đúng 1 chỗ khớp, thấy {n}. Mã nguồn đã khác bản dùng để viết patch.")
+              return src.replace(old, new, 1)
+
+
+          def check(src, musts, label):
+              for m in musts:
+                  if m not in src:
+                      sys.exit(f"::error::Sau khi vá {label} thiếu: {m}")
+
+
+          # =====================================================================================================
+          # 1) shared: LyricsTranslation.kt
+          # =====================================================================================================
+          LT = path("shared", "src", "jvmSharedMain", "kotlin", "com", "music", "bitchord", "data", "lyrics", "LyricsTranslation.kt")
+          src = read(LT)
+          if "geminiBudgetLeft" in src:
+              print("LyricsTranslation.kt đã có bản vá token, bỏ qua.")
+          else:
+              src = once(
+                  src,
+                  "import kotlinx.serialization.json.contentOrNull\n",
+                  "import kotlinx.serialization.json.contentOrNull\nimport kotlinx.serialization.json.longOrNull\n",
+                  "import longOrNull",
+              )
+              src = once(
+                  src,
+                  "data class GeminiSettings(val apiKey: String, val model: String)",
+                  "data class GeminiSettings(val apiKey: String, val model: String, val aiEnabled: Boolean = true)",
+                  "GeminiSettings.aiEnabled",
+              )
+              src = once(
+                  src,
+                  "        data object Unavailable : Result\n    }\n",
+                  "        data object Unavailable : Result\n\n"
+                  "        /**\n"
+                  "         * The AI could not translate this song. There is deliberately no silent fallback: the player offers\n"
+                  "         * a separate Google Translate button. [limitReached] is the listener's own daily token cap;\n"
+                  "         * [httpCode] is Gemini's HTTP status (429 quota, 400/401/403 key), 0 for a timeout or no network.\n"
+                  "         */\n"
+                  "        data class AiFailed(val limitReached: Boolean, val httpCode: Int) : Result\n"
+                  "    }\n",
+                  "Result.AiFailed",
+              )
+              src = once(
+                  src,
+                  "    @Volatile\n    var gemini: () -> GeminiSettings? = { null }\n",
+                  "    @Volatile\n    var gemini: () -> GeminiSettings? = { null }\n"
+                  "\n"
+                  "    /** Called with what one Gemini reply cost: the prompt tokens and the total (prompt + answer + thinking). */\n"
+                  "    @Volatile\n"
+                  "    var onGeminiUsage: (promptTokens: Long, totalTokens: Long) -> Unit = { _, _ -> }\n"
+                  "\n"
+                  "    /** False once the listener's own daily token cap is reached: AI translation then waits for tomorrow. */\n"
+                  "    @Volatile\n"
+                  "    var geminiBudgetLeft: () -> Boolean = { true }\n"
+                  "\n"
+                  "    /** HTTP status of the last failed Gemini call (0 for a timeout or no network), to tell quota from a bad key. */\n"
+                  "    @Volatile\n"
+                  "    private var lastGeminiHttpCode = 0\n",
+                  "hooks",
+              )
+              src = once(
+                  src,
+                  "    suspend fun translate(\n        trackId: String,\n        lines: List<LyricLine>,\n        targetLanguageTag: String,\n    ): Result {\n",
+                  "    suspend fun translate(\n        trackId: String,\n        lines: List<LyricLine>,\n        targetLanguageTag: String,\n"
+                  "        /** True for the separate Google Translate button: skip the AI whatever the setting says. */\n"
+                  "        googleOnly: Boolean = false,\n    ): Result {\n",
+                  "translate(googleOnly)",
+              )
+              src = once(
+                  src,
+                  "val ai = gemini()?.takeIf { it.apiKey.isNotBlank() }",
+                  "val ai = gemini()?.takeIf { it.apiKey.isNotBlank() && it.aiEnabled && !googleOnly }",
+                  "ai chọn theo cài đặt",
+              )
+              src = once(
+                  src,
+                  "        if (ai != null) {\n            val answer = translateWithGemini(slots, target, ai)\n",
+                  "        if (ai != null) {\n"
+                  "            // The listener's own daily cap: stop here and let the player offer Google Translate instead.\n"
+                  "            if (!geminiBudgetLeft()) return Result.AiFailed(limitReached = true, httpCode = 0)\n"
+                  "            lastGeminiHttpCode = 0\n"
+                  "            val answer = translateWithGemini(slots, target, ai)\n",
+                  "chặn khi hết giới hạn",
+              )
+              src = once(
+                  src,
+                  "            // Gemini could not answer (no network, quota, a malformed reply): Google Translate still can.\n",
+                  "            // Gemini could not answer (no network, quota, a malformed reply). No silent fallback: the player\n"
+                  "            // shows a separate Google Translate button, so the listener decides.\n"
+                  "            return Result.AiFailed(limitReached = false, httpCode = lastGeminiHttpCode)\n",
+                  "AI lỗi thì báo lỗi, không tự quay về Google",
+              )
+              # Ghi mã lỗi HTTP của lần dịch chính (lượt rà và tra cứu lỗi thì vẫn được bỏ qua như cũ).
+              src = once(
+                  src,
+                  "            geminiClient.newCall(request).awaitBody()\n        } catch (cancelled: CancellationException) {\n            throw cancelled\n        } catch (_: IOException) {\n            return null\n        }\n",
+                  "            geminiClient.newCall(request).awaitBody()\n        } catch (cancelled: CancellationException) {\n            throw cancelled\n        } catch (error: IOException) {\n            noteGeminiError(error)\n            return null\n        }\n",
+                  "ghi mã lỗi HTTP",
+              )
+              # Đếm token ở cả ba lời gọi (tra cứu, rà xưng hô, dịch).
+              pat = re.compile(r"(\n        )(return runCatching \{\n            val root = json\.parseToJsonElement\(response\)\.jsonObject)")
+              found = pat.findall(src)
+              if len(found) != 3:
+                  sys.exit(f"::error::Đếm token: cần đúng 3 chỗ đọc phản hồi Gemini, thấy {len(found)}.")
+              src = pat.sub(lambda m: m.group(1) + "recordGeminiUsage(response)" + m.group(1) + m.group(2), src)
+              src = once(
+                  src,
+                  "    private class GeminiAnswer(",
+                  "    /** Remembers the HTTP status inside the IOException that [awaitBody] throws for a non-2xx reply. */\n"
+                  "    private fun noteGeminiError(error: IOException) {\n"
+                  "        lastGeminiHttpCode = Regex(\"HTTP (\\\\d{3})\").find(error.message.orEmpty())\n"
+                  "            ?.groupValues?.get(1)?.toIntOrNull() ?: 0\n"
+                  "    }\n"
+                  "\n"
+                  "    /** Reads usageMetadata from a Gemini reply and reports it; a reply without it counts for nothing. */\n"
+                  "    private fun recordGeminiUsage(response: String) {\n"
+                  "        try {\n"
+                  "            val meta = json.parseToJsonElement(response).jsonObject[\"usageMetadata\"]?.jsonObject ?: return\n"
+                  "            val prompt = meta[\"promptTokenCount\"]?.jsonPrimitive?.longOrNull ?: 0L\n"
+                  "            val answer = meta[\"candidatesTokenCount\"]?.jsonPrimitive?.longOrNull ?: 0L\n"
+                  "            val thinking = meta[\"thoughtsTokenCount\"]?.jsonPrimitive?.longOrNull ?: 0L\n"
+                  "            val total = meta[\"totalTokenCount\"]?.jsonPrimitive?.longOrNull ?: (prompt + answer + thinking)\n"
+                  "            if (total > 0L) onGeminiUsage(prompt, total)\n"
+                  "        } catch (_: Exception) {\n"
+                  "            // A reply we cannot read for usage still translates; it just is not counted.\n"
+                  "        }\n"
+                  "    }\n"
+                  "\n"
+                  "    private class GeminiAnswer(",
+                  "recordGeminiUsage",
+              )
+              check(src, ["Result.AiFailed(limitReached = true", "recordGeminiUsage(response)", "googleOnly", "noteGeminiError(error)"], "LyricsTranslation.kt")
+              write(LT, src)
+              print("Đã vá LyricsTranslation.kt: đếm token, giới hạn ngày, chọn AI/Google, AI lỗi trả AiFailed.")
+
+          # =====================================================================================================
+          # 2) sharedUi: PlayerHost.kt (giao diện giữa UI và nền tảng)
+          # =====================================================================================================
+          PH = path("sharedUi", "src", "jvmSharedMain", "kotlin", "com", "music", "bitchord", "ui", "player", "PlayerHost.kt")
+          src = read(PH)
+          if "translateLyricsWithGoogle" not in src:
+              src = once(
+                  src,
+                  "    suspend fun translateLyrics(\n        trackId: String,\n        lines: List<LyricLine>,\n        targetLanguageTag: String,\n    ): LyricsTranslationResult\n",
+                  "    suspend fun translateLyrics(\n        trackId: String,\n        lines: List<LyricLine>,\n        targetLanguageTag: String,\n    ): LyricsTranslationResult\n"
+                  "\n"
+                  "    /** Same as [translateLyrics] but through Google Translate, whatever the AI setting says. */\n"
+                  "    suspend fun translateLyricsWithGoogle(\n        trackId: String,\n        lines: List<LyricLine>,\n        targetLanguageTag: String,\n    ): LyricsTranslationResult\n",
+                  "PlayerHost.translateLyricsWithGoogle",
+              )
+              src = once(
+                  src,
+                  "    data object Unavailable : LyricsTranslationResult\n}\n",
+                  "    data object Unavailable : LyricsTranslationResult\n\n"
+                  "    /** The AI could not translate; the player then offers a separate Google Translate button. */\n"
+                  "    data class AiFailed(val limitReached: Boolean, val httpCode: Int) : LyricsTranslationResult\n}\n",
+                  "LyricsTranslationResult.AiFailed",
+              )
+              write(PH, src)
+              print("Đã vá PlayerHost.kt")
+
+          # =====================================================================================================
+          # 3) app: AndroidPlayerHost.kt
+          # =====================================================================================================
+          APH = path("app", "src", "main", "java", "com", "music", "bitchord", "ui", "player", "AndroidPlayerHost.kt")
+          src = read(APH)
+          if "translateLyricsWithGoogle" not in src:
+              src = once(
+                  src,
+                  "            is LyricsTranslation.Result.SameLanguage -> LyricsTranslationResult.SameLanguage(result.language)\n"
+                  "            LyricsTranslation.Result.Unavailable -> LyricsTranslationResult.Unavailable\n"
+                  "        }\n",
+                  "            is LyricsTranslation.Result.SameLanguage -> LyricsTranslationResult.SameLanguage(result.language)\n"
+                  "            is LyricsTranslation.Result.AiFailed -> LyricsTranslationResult.AiFailed(result.limitReached, result.httpCode)\n"
+                  "            LyricsTranslation.Result.Unavailable -> LyricsTranslationResult.Unavailable\n"
+                  "        }\n"
+                  "\n"
+                  "    override suspend fun translateLyricsWithGoogle(\n"
+                  "        trackId: String,\n"
+                  "        lines: List<LyricLine>,\n"
+                  "        targetLanguageTag: String,\n"
+                  "    ): LyricsTranslationResult =\n"
+                  "        when (val result = LyricsTranslation.translate(trackId, lines, targetLanguageTag, googleOnly = true)) {\n"
+                  "            is LyricsTranslation.Result.Translated -> LyricsTranslationResult.Translated(result.lines)\n"
+                  "            is LyricsTranslation.Result.SameLanguage -> LyricsTranslationResult.SameLanguage(result.language)\n"
+                  "            is LyricsTranslation.Result.AiFailed -> LyricsTranslationResult.Unavailable\n"
+                  "            LyricsTranslation.Result.Unavailable -> LyricsTranslationResult.Unavailable\n"
+                  "        }\n",
+                  "AndroidPlayerHost",
+              )
+              write(APH, src)
+              print("Đã vá AndroidPlayerHost.kt")
+
+          # =====================================================================================================
+          # 4) sharedUi: PlayerLyrics.kt + 3 chỗ gọi LyricsTranslationMotion
+          # =====================================================================================================
+          PL = path("sharedUi", "src", "jvmSharedMain", "kotlin", "com", "music", "bitchord", "ui", "player", "PlayerLyrics.kt")
+          src = read(PL)
+          if "LyricsGoogleFallback" not in src:
+              # 4a) lớp dữ liệu cho nút dự phòng + field mới trong LyricsTranslationUi
+              src = once(
+                  src,
+                  "/**\n * Everything the player shows about a lyric translation or romanization, and\n",
+                  "/** The separate Google Translate button, shown after the AI could not translate: why, and what a tap does. */\n"
+                  "internal class LyricsGoogleFallback(\n"
+                  "    val message: String,\n"
+                  "    val onClick: () -> Unit,\n"
+                  ")\n"
+                  "\n"
+                  "/**\n * Everything the player shows about a lyric translation or romanization, and\n",
+                  "LyricsGoogleFallback",
+              )
+              src = once(
+                  src,
+                  "    val toggleTranslation: () -> Unit,\n    val toggleRomanization: () -> Unit,\n)\n",
+                  "    val toggleTranslation: () -> Unit,\n    val toggleRomanization: () -> Unit,\n"
+                  "    /** Set while the AI has failed on this song and nothing is loading: the Google Translate button. */\n"
+                  "    val googleFallback: LyricsGoogleFallback? = null,\n)\n",
+                  "LyricsTranslationUi.googleFallback",
+              )
+              # 4b) chuỗi thông báo đã giải sẵn + trạng thái lỗi AI
+              src = once(
+                  src,
+                  "    val romanizationUnavailableMessage = stringResource(Res.string.lyrics_romanization_unavailable)\n",
+                  "    val romanizationUnavailableMessage = stringResource(Res.string.lyrics_romanization_unavailable)\n"
+                  "    val aiLimitMessage = stringResource(Res.string.lyrics_ai_limit)\n"
+                  "    val aiQuotaMessage = stringResource(Res.string.lyrics_ai_quota)\n"
+                  "    val aiKeyMessage = stringResource(Res.string.lyrics_ai_key)\n"
+                  "    val aiFailedMessage = stringResource(Res.string.lyrics_ai_failed)\n",
+                  "chuỗi thông báo AI",
+              )
+              src = once(
+                  src,
+                  "    var translationState by remember(trackId, translationLanguage, lyrics) {\n"
+                  "        mutableStateOf<LyricsTranslationUiState>(LyricsTranslationUiState.Idle)\n"
+                  "    }\n",
+                  "    var translationState by remember(trackId, translationLanguage, lyrics) {\n"
+                  "        mutableStateOf<LyricsTranslationUiState>(LyricsTranslationUiState.Idle)\n"
+                  "    }\n"
+                  "    // Why the AI could not translate this song; null until it fails. Reset per track, language and lyric sheet.\n"
+                  "    var aiFailureMessage by remember(trackId, translationLanguage, lyrics) { mutableStateOf<String?>(null) }\n",
+                  "aiFailureMessage",
+              )
+              # 4c) AI dịch được thì xoá lỗi cũ
+              src = once(
+                  src,
+                  "                            translationState = LyricsTranslationUiState.Ready(result.lines)\n"
+                  "                            lyricsDisplayMode = LyricsDisplayMode.Translated\n",
+                  "                            aiFailureMessage = null\n"
+                  "                            translationState = LyricsTranslationUiState.Ready(result.lines)\n"
+                  "                            lyricsDisplayMode = LyricsDisplayMode.Translated\n",
+                  "xoá lỗi AI khi dịch được",
+              )
+              # 4d) nhánh AiFailed của lần dịch chính
+              src = once(
+                  src,
+                  "                        LyricsTranslationResult.Unavailable -> {\n"
+                  "                            translationState = LyricsTranslationUiState.Idle\n"
+                  "                            PlayerPlatform.host.showMessage(translationUnavailableMessage)\n"
+                  "                        }\n",
+                  "                        is LyricsTranslationResult.AiFailed -> {\n"
+                  "                            val reason = when {\n"
+                  "                                result.limitReached -> aiLimitMessage\n"
+                  "                                result.httpCode == 429 -> aiQuotaMessage\n"
+                  "                                result.httpCode == 400 || result.httpCode == 401 || result.httpCode == 403 -> aiKeyMessage\n"
+                  "                                else -> aiFailedMessage\n"
+                  "                            }\n"
+                  "                            translationState = LyricsTranslationUiState.Idle\n"
+                  "                            aiFailureMessage = reason\n"
+                  "                            PlayerPlatform.host.showMessage(reason)\n"
+                  "                        }\n"
+                  "                        LyricsTranslationResult.Unavailable -> {\n"
+                  "                            translationState = LyricsTranslationUiState.Idle\n"
+                  "                            PlayerPlatform.host.showMessage(translationUnavailableMessage)\n"
+                  "                        }\n",
+                  "nhánh AiFailed",
+              )
+              # 4e) hàm dịch bằng Google Dịch (nút riêng)
+              GOOGLE_FN = (
+                  "    // The separate Google Translate button: runs only when the listener taps it, after the AI failed.\n"
+                  "    val translateWithGoogle: () -> Unit = translateWithGoogle@{\n"
+                  "        if (translationState is LyricsTranslationUiState.Loading) return@translateWithGoogle\n"
+                  "        val source = lyrics.orEmpty()\n"
+                  "        if (source.isEmpty()) return@translateWithGoogle\n"
+                  "        haptics.play(Haptic.Tap)\n"
+                  "        translationState = LyricsTranslationUiState.Loading\n"
+                  "        romanizationJob?.cancel()\n"
+                  "        if (romanizationState is LyricsTranslationUiState.Loading) {\n"
+                  "            romanizationState = LyricsTranslationUiState.Idle\n"
+                  "        }\n"
+                  "        translationJob?.cancel()\n"
+                  "        translationJob = translationScope.launch {\n"
+                  "            when (\n"
+                  "                val result = PlayerPlatform.host.translateLyricsWithGoogle(\n"
+                  "                    trackId = trackId,\n"
+                  "                    lines = source,\n"
+                  "                    targetLanguageTag = translationLanguage,\n"
+                  "                )\n"
+                  "            ) {\n"
+                  "                is LyricsTranslationResult.Translated -> {\n"
+                  "                    aiFailureMessage = null\n"
+                  "                    translationState = LyricsTranslationUiState.Ready(result.lines)\n"
+                  "                    lyricsDisplayMode = LyricsDisplayMode.Translated\n"
+                  "                    translationTransition++\n"
+                  "                    haptics.play(Haptic.ToggleOn)\n"
+                  "                }\n"
+                  "                is LyricsTranslationResult.SameLanguage -> {\n"
+                  "                    aiFailureMessage = null\n"
+                  "                    translationState = LyricsTranslationUiState.SameLanguage\n"
+                  "                    PlayerPlatform.host.showMessage(alreadyInLanguageMessage)\n"
+                  "                }\n"
+                  "                else -> {\n"
+                  "                    translationState = LyricsTranslationUiState.Idle\n"
+                  "                    PlayerPlatform.host.showMessage(translationUnavailableMessage)\n"
+                  "                }\n"
+                  "            }\n"
+                  "        }\n"
+                  "    }\n"
+              )
+              src = once(
+                  src,
+                  "    val toggleRomanization: () -> Unit = toggleRomanization@{\n",
+                  GOOGLE_FN + "    val toggleRomanization: () -> Unit = toggleRomanization@{\n",
+                  "translateWithGoogle",
+              )
+              src = once(
+                  src,
+                  "        toggleTranslation = toggleTranslation,\n        toggleRomanization = toggleRomanization,\n    )\n}\n",
+                  "        toggleTranslation = toggleTranslation,\n        toggleRomanization = toggleRomanization,\n"
+                  "        googleFallback = aiFailureMessage\n"
+                  "            ?.takeIf { translationState is LyricsTranslationUiState.Idle }\n"
+                  "            ?.let { LyricsGoogleFallback(it, translateWithGoogle) },\n"
+                  "    )\n}\n",
+                  "trả googleFallback",
+              )
+              # 4f) LyricsTranslationMotion vẽ thêm nút Google Dịch ở đầu phần lời
+              src = once(
+                  src,
+                  "    content: @Composable (State<Float>?) -> Unit,\n) {\n    val progress = remember { Animatable(1f) }\n",
+                  "    googleFallback: LyricsGoogleFallback? = null,\n    content: @Composable (State<Float>?) -> Unit,\n) {\n    val progress = remember { Animatable(1f) }\n",
+                  "LyricsTranslationMotion tham số",
+              )
+              src = once(
+                  src,
+                  "        content(progress.asState().takeIf { !reduceMotion && foreground && trigger > 0 })\n    }\n}\n",
+                  "        content(progress.asState().takeIf { !reduceMotion && foreground && trigger > 0 })\n"
+                  "        if (googleFallback != null) {\n"
+                  "            GoogleTranslateChip(googleFallback, Modifier.align(Alignment.TopCenter))\n"
+                  "        }\n"
+                  "    }\n}\n"
+                  "\n"
+                  "/** Why the AI could not translate, with a separate button that translates through Google Translate. */\n"
+                  "@Composable\n"
+                  "private fun GoogleTranslateChip(fallback: LyricsGoogleFallback, modifier: Modifier = Modifier) {\n"
+                  "    Row(\n"
+                  "        modifier = modifier\n"
+                  "            .padding(top = 8.dp, start = 16.dp, end = 16.dp)\n"
+                  "            .clip(CircleShape)\n"
+                  "            .background(Color.Black.copy(alpha = 0.6f))\n"
+                  "            .clickable(onClick = fallback.onClick)\n"
+                  "            .padding(horizontal = 14.dp, vertical = 8.dp),\n"
+                  "        verticalAlignment = Alignment.CenterVertically,\n"
+                  "    ) {\n"
+                  "        Icon(\n"
+                  "            imageVector = Icons.Rounded.Translate,\n"
+                  "            contentDescription = null,\n"
+                  "            tint = Color.White,\n"
+                  "            modifier = Modifier.size(18.dp),\n"
+                  "        )\n"
+                  "        Spacer(Modifier.width(8.dp))\n"
+                  "        Column {\n"
+                  "            Text(\n"
+                  "                text = fallback.message,\n"
+                  "                color = Color.White.copy(alpha = 0.72f),\n"
+                  "                fontSize = 11.sp,\n"
+                  "            )\n"
+                  "            Text(\n"
+                  "                text = stringResource(Res.string.translate_with_google),\n"
+                  "                color = Color.White,\n"
+                  "                fontSize = 13.sp,\n"
+                  "                fontWeight = FontWeight.SemiBold,\n"
+                  "            )\n"
+                  "        }\n"
+                  "    }\n"
+                  "}\n",
+                  "LyricsTranslationMotion vẽ nút",
+              )
+              check(src, ["translateWithGoogle", "GoogleTranslateChip", "LyricsGoogleFallback", "aiFailureMessage"], "PlayerLyrics.kt")
+              write(PL, src)
+              print("Đã vá PlayerLyrics.kt")
+
+          # ba chỗ gọi LyricsTranslationMotion truyền nút dự phòng vào
+          CALLERS = [
+              path("sharedUi", "src", "jvmSharedMain", "kotlin", "com", "music", "bitchord", "ui", "player", "NowPlayingScreen.kt"),
+              path("sharedUi", "src", "jvmSharedMain", "kotlin", "com", "music", "bitchord", "ui", "player", "PlayerSidePanels.kt"),
+          ]
+          call_pat = re.compile(r"(\n([ \t]*)reduceMotion = lyricsTranslation\.reduceMotion,\n)")
+          total = 0
+          for cp in CALLERS:
+              s = read(cp)
+              if "googleFallback = lyricsTranslation.googleFallback" in s:
+                  total += s.count("googleFallback = lyricsTranslation.googleFallback")
+                  continue
+              n = len(call_pat.findall(s))
+              total += n
+              s = call_pat.sub(lambda m: m.group(1) + m.group(2) + "googleFallback = lyricsTranslation.googleFallback,\n", s)
+              write(cp, s)
+          if total != 3:
+              sys.exit(f"::error::Cần đúng 3 chỗ gọi LyricsTranslationMotion, thấy {total}.")
+          print("Đã nối nút Google Dịch vào 3 chỗ hiển thị lời.")
+
+          # =====================================================================================================
+          # 5) app: GeminiUsageStore.kt (file mới) + BitChordApplication + SettingsSheet
+          # =====================================================================================================
+          STORE = path("app", "src", "main", "java", "com", "music", "bitchord", "data", "settings", "GeminiUsageStore.kt")
+          STORE_SRC = r'''package com.music.bitchord.data.settings
+
+          import android.content.Context
+          import android.content.SharedPreferences
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+          import kotlinx.coroutines.flow.MutableStateFlow
+          import kotlinx.coroutines.flow.StateFlow
+
+          /**
+           * What the Gemini lyric translation has cost so far, counted from the usageMetadata of every reply, plus the two
+           * choices that sit next to it: AI or Google Translate, and an optional daily token cap.
+           *
+           * Google does not expose the real quota through the API, so these numbers are this app's own count, per device and
+           * per local day. The cap is soft: a song already being translated is allowed to finish.
+           */
+          object GeminiUsageStore {
+              data class Usage(
+                  val day: String = "",
+                  val todayPrompt: Long = 0L,
+                  val todayTotal: Long = 0L,
+                  val todayRequests: Int = 0,
+                  val allPrompt: Long = 0L,
+                  val allTotal: Long = 0L,
+                  val allRequests: Long = 0L,
+                  val lastTotal: Long = 0L,
+                  /** Tokens per day the listener allows; 0 for no cap. */
+                  val dailyLimit: Long = 0L,
+                  /** True: the AI translates (and a separate Google button shows when it fails). False: Google Translate only. */
+                  val useAi: Boolean = true,
+              ) {
+                  val todayOutput: Long get() = (todayTotal - todayPrompt).coerceAtLeast(0L)
+                  val allOutput: Long get() = (allTotal - allPrompt).coerceAtLeast(0L)
+                  val limitReached: Boolean get() = dailyLimit > 0L && todayTotal >= dailyLimit
+              }
+
+              private const val PREFS = "gemini_usage"
+              private const val K_DAY = "day"
+              private const val K_TODAY_PROMPT = "today_prompt"
+              private const val K_TODAY_TOTAL = "today_total"
+              private const val K_TODAY_REQUESTS = "today_requests"
+              private const val K_ALL_PROMPT = "all_prompt"
+              private const val K_ALL_TOTAL = "all_total"
+              private const val K_ALL_REQUESTS = "all_requests"
+              private const val K_LAST_TOTAL = "last_total"
+              private const val K_LIMIT = "daily_limit"
+              private const val K_USE_AI = "use_ai"
+
+              private var prefs: SharedPreferences? = null
+              private val state = MutableStateFlow(Usage())
+              val usage: StateFlow<Usage> = state
+
+              @Synchronized
+              fun init(context: Context) {
+                  val p = context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                  prefs = p
+                  state.value = rolled(
+                      Usage(
+                          day = p.getString(K_DAY, "").orEmpty(),
+                          todayPrompt = p.getLong(K_TODAY_PROMPT, 0L),
+                          todayTotal = p.getLong(K_TODAY_TOTAL, 0L),
+                          todayRequests = p.getInt(K_TODAY_REQUESTS, 0),
+                          allPrompt = p.getLong(K_ALL_PROMPT, 0L),
+                          allTotal = p.getLong(K_ALL_TOTAL, 0L),
+                          allRequests = p.getLong(K_ALL_REQUESTS, 0L),
+                          lastTotal = p.getLong(K_LAST_TOTAL, 0L),
+                          dailyLimit = p.getLong(K_LIMIT, 0L),
+                          useAi = p.getBoolean(K_USE_AI, true),
+                      ),
+                  )
+              }
+
+              /** One Gemini reply: [promptTokens] went in, [totalTokens] is everything it cost (answer and thinking included). */
+              @Synchronized
+              fun record(promptTokens: Long, totalTokens: Long) {
+                  val u = rolled(state.value)
+                  store(
+                      u.copy(
+                          todayPrompt = u.todayPrompt + promptTokens,
+                          todayTotal = u.todayTotal + totalTokens,
+                          todayRequests = u.todayRequests + 1,
+                          allPrompt = u.allPrompt + promptTokens,
+                          allTotal = u.allTotal + totalTokens,
+                          allRequests = u.allRequests + 1L,
+                          lastTotal = totalTokens,
+                      ),
+                  )
+              }
+
+              @Synchronized
+              fun resetUsage() {
+                  store(
+                      rolled(state.value).copy(
+                          todayPrompt = 0L,
+                          todayTotal = 0L,
+                          todayRequests = 0,
+                          allPrompt = 0L,
+                          allTotal = 0L,
+                          allRequests = 0L,
+                          lastTotal = 0L,
+                      ),
+                  )
+              }
+
+              @Synchronized
+              fun setDailyLimit(limit: Long) {
+                  store(rolled(state.value).copy(dailyLimit = limit.coerceAtLeast(0L)))
+              }
+
+              @Synchronized
+              fun setUseAi(useAi: Boolean) {
+                  store(rolled(state.value).copy(useAi = useAi))
+              }
+
+              /** False once today's tokens have reached the daily cap. A new day starts the count again. */
+              @Synchronized
+              fun budgetLeft(): Boolean {
+                  val u = rolled(state.value)
+                  if (u != state.value) state.value = u
+                  return !u.limitReached
+              }
+
+              /** 950 -> "950", 12 345 -> "12.3K", 1 250 000 -> "1.25M". */
+              fun format(tokens: Long): String = when {
+                  tokens < 1_000L -> tokens.toString()
+                  tokens < 1_000_000L -> String.format(Locale.US, "%.1fK", tokens / 1_000.0)
+                  else -> String.format(Locale.US, "%.2fM", tokens / 1_000_000.0)
+              }
+
+              private fun rolled(u: Usage): Usage {
+                  val today = today()
+                  return if (u.day == today) u else u.copy(day = today, todayPrompt = 0L, todayTotal = 0L, todayRequests = 0)
+              }
+
+              private fun store(u: Usage) {
+                  state.value = u
+                  prefs?.edit()
+                      ?.putString(K_DAY, u.day)
+                      ?.putLong(K_TODAY_PROMPT, u.todayPrompt)
+                      ?.putLong(K_TODAY_TOTAL, u.todayTotal)
+                      ?.putInt(K_TODAY_REQUESTS, u.todayRequests)
+                      ?.putLong(K_ALL_PROMPT, u.allPrompt)
+                      ?.putLong(K_ALL_TOTAL, u.allTotal)
+                      ?.putLong(K_ALL_REQUESTS, u.allRequests)
+                      ?.putLong(K_LAST_TOTAL, u.lastTotal)
+                      ?.putLong(K_LIMIT, u.dailyLimit)
+                      ?.putBoolean(K_USE_AI, u.useAi)
+                      ?.apply()
+              }
+
+              private fun today(): String = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
+          }
+          '''
+          if not os.path.exists(STORE):
+              write(STORE, STORE_SRC)
+              print("Đã tạo GeminiUsageStore.kt")
+
+          APP = path("app", "src", "main", "java", "com", "music", "bitchord", "BitChordApplication.kt")
+          src = read(APP)
+          if "GeminiUsageStore" not in src:
+              src = once(
+                  src,
+                  "        LyricsTranslation.gemini = {\n"
+                  "            com.music.bitchord.data.lyrics.GeminiSettings(AppSettings.geminiApiKey.value, AppSettings.geminiModel.value)\n"
+                  "        }\n",
+                  "        com.music.bitchord.data.settings.GeminiUsageStore.init(this)\n"
+                  "        LyricsTranslation.gemini = {\n"
+                  "            com.music.bitchord.data.lyrics.GeminiSettings(\n"
+                  "                AppSettings.geminiApiKey.value,\n"
+                  "                AppSettings.geminiModel.value,\n"
+                  "                com.music.bitchord.data.settings.GeminiUsageStore.usage.value.useAi,\n"
+                  "            )\n"
+                  "        }\n"
+                  "        LyricsTranslation.onGeminiUsage = { prompt, total ->\n"
+                  "            com.music.bitchord.data.settings.GeminiUsageStore.record(prompt, total)\n"
+                  "        }\n"
+                  "        LyricsTranslation.geminiBudgetLeft = { com.music.bitchord.data.settings.GeminiUsageStore.budgetLeft() }\n",
+                  "BitChordApplication",
+              )
+              write(APP, src)
+              print("Đã vá BitChordApplication.kt")
+
+          SS = path("app", "src", "main", "java", "com", "music", "bitchord", "ui", "screens", "SettingsSheet.kt")
+          src = read(SS)
+          if "GeminiUsageStore" not in src:
+              src = once(
+                  src,
+                  "import androidx.compose.material3.TextButton\n",
+                  "import androidx.compose.material3.TextButton\n"
+                  "import androidx.compose.material3.Switch\n"
+                  "import androidx.compose.foundation.text.KeyboardOptions\n"
+                  "import androidx.compose.ui.text.input.KeyboardType\n"
+                  "import com.music.bitchord.data.settings.GeminiUsageStore\n",
+                  "SettingsSheet imports",
+              )
+              src = once(
+                  src,
+                  "    val geminiModel by AppSettings.geminiModel.collectAsStateWithLifecycle()\n",
+                  "    val geminiModel by AppSettings.geminiModel.collectAsStateWithLifecycle()\n"
+                  "    val geminiUsage by GeminiUsageStore.usage.collectAsStateWithLifecycle()\n",
+                  "geminiUsage state",
+              )
+              src = once(
+                  src,
+                  "                            stringResource(R.string.gemini_translation_on, geminiModel.ifBlank { stringResource(R.string.gemini_model_default) })\n",
+                  "                            if (geminiUsage.useAi) {\n"
+                  "                                stringResource(R.string.gemini_translation_on, geminiModel.ifBlank { stringResource(R.string.gemini_model_default) }) +\n"
+                  "                                    \" · \" +\n"
+                  "                                    stringResource(R.string.gemini_usage_today_short, GeminiUsageStore.format(geminiUsage.todayTotal))\n"
+                  "                            } else {\n"
+                  "                                stringResource(R.string.gemini_translation_google_only)\n"
+                  "                            }\n",
+                  "subtitle dòng Gemini",
+              )
+              src = once(
+                  src,
+                  "        var modelInput by remember { mutableStateOf(geminiModel) }\n",
+                  "        var modelInput by remember { mutableStateOf(geminiModel) }\n"
+                  "        var useAiInput by remember { mutableStateOf(geminiUsage.useAi) }\n"
+                  "        var limitInput by remember {\n"
+                  "            mutableStateOf(if (geminiUsage.dailyLimit > 0L) geminiUsage.dailyLimit.toString() else \"\")\n"
+                  "        }\n",
+                  "trạng thái hộp thoại",
+              )
+              src = once(
+                  src,
+                  "            text = {\n                Column {\n                    Text(\n                        text = stringResource(R.string.gemini_translation_hint),\n",
+                  "            text = {\n                Column(Modifier.verticalScroll(rememberScrollState())) {\n                    Text(\n                        text = stringResource(R.string.gemini_translation_hint),\n",
+                  "hộp thoại cuộn được",
+              )
+              NEW_BLOCK = (
+                  "                        placeholder = { Text(stringResource(R.string.gemini_model_default)) },\n"
+                  "                        singleLine = true,\n"
+                  "                        modifier = Modifier.fillMaxWidth(),\n"
+                  "                    )\n"
+                  "                    Spacer(Modifier.height(12.dp))\n"
+                  "                    Row(verticalAlignment = Alignment.CenterVertically) {\n"
+                  "                        Text(\n"
+                  "                            text = stringResource(R.string.gemini_use_ai),\n"
+                  "                            style = MaterialTheme.typography.bodyMedium,\n"
+                  "                            modifier = Modifier.weight(1f),\n"
+                  "                        )\n"
+                  "                        Switch(checked = useAiInput, onCheckedChange = { useAiInput = it })\n"
+                  "                    }\n"
+                  "                    Text(\n"
+                  "                        text = stringResource(R.string.gemini_use_ai_hint),\n"
+                  "                        style = MaterialTheme.typography.bodySmall,\n"
+                  "                    )\n"
+                  "                    Spacer(Modifier.height(12.dp))\n"
+                  "                    OutlinedTextField(\n"
+                  "                        value = limitInput,\n"
+                  "                        onValueChange = { limitInput = it.filter { c -> c.isDigit() }.take(10) },\n"
+                  "                        label = { Text(stringResource(R.string.gemini_daily_limit)) },\n"
+                  "                        singleLine = true,\n"
+                  "                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),\n"
+                  "                        modifier = Modifier.fillMaxWidth(),\n"
+                  "                    )\n"
+                  "                    Spacer(Modifier.height(12.dp))\n"
+                  "                    Text(\n"
+                  "                        text = stringResource(R.string.gemini_usage_title),\n"
+                  "                        style = MaterialTheme.typography.titleSmall,\n"
+                  "                    )\n"
+                  "                    Text(\n"
+                  "                        text = stringResource(\n"
+                  "                            R.string.gemini_usage_today,\n"
+                  "                            GeminiUsageStore.format(geminiUsage.todayTotal),\n"
+                  "                            GeminiUsageStore.format(geminiUsage.todayPrompt),\n"
+                  "                            GeminiUsageStore.format(geminiUsage.todayOutput),\n"
+                  "                            geminiUsage.todayRequests,\n"
+                  "                        ),\n"
+                  "                        style = MaterialTheme.typography.bodySmall,\n"
+                  "                    )\n"
+                  "                    Text(\n"
+                  "                        text = stringResource(\n"
+                  "                            R.string.gemini_usage_all,\n"
+                  "                            GeminiUsageStore.format(geminiUsage.allTotal),\n"
+                  "                            GeminiUsageStore.format(geminiUsage.allPrompt),\n"
+                  "                            GeminiUsageStore.format(geminiUsage.allOutput),\n"
+                  "                            geminiUsage.allRequests,\n"
+                  "                        ),\n"
+                  "                        style = MaterialTheme.typography.bodySmall,\n"
+                  "                    )\n"
+                  "                    Text(\n"
+                  "                        text = stringResource(R.string.gemini_usage_last, GeminiUsageStore.format(geminiUsage.lastTotal)),\n"
+                  "                        style = MaterialTheme.typography.bodySmall,\n"
+                  "                    )\n"
+                  "                    if (geminiUsage.limitReached) {\n"
+                  "                        Text(\n"
+                  "                            text = stringResource(R.string.gemini_limit_reached),\n"
+                  "                            style = MaterialTheme.typography.bodySmall,\n"
+                  "                            color = MaterialTheme.colorScheme.error,\n"
+                  "                        )\n"
+                  "                    }\n"
+                  "                    Text(\n"
+                  "                        text = stringResource(R.string.gemini_usage_note),\n"
+                  "                        style = MaterialTheme.typography.bodySmall,\n"
+                  "                        modifier = Modifier.padding(top = 4.dp),\n"
+                  "                    )\n"
+                  "                    TextButton(onClick = { GeminiUsageStore.resetUsage() }) {\n"
+                  "                        Text(stringResource(R.string.gemini_usage_reset))\n"
+                  "                    }\n"
+                  "                }\n"
+                  "            },\n"
+              )
+              src = once(
+                  src,
+                  "                        placeholder = { Text(stringResource(R.string.gemini_model_default)) },\n"
+                  "                        singleLine = true,\n"
+                  "                        modifier = Modifier.fillMaxWidth(),\n"
+                  "                    )\n"
+                  "                }\n"
+                  "            },\n",
+                  NEW_BLOCK,
+                  "nội dung hộp thoại",
+              )
+              src = once(
+                  src,
+                  "                    AppSettings.setGeminiTranslation(keyInput.trim(), modelInput.trim())\n                    showGeminiDialog = false\n",
+                  "                    AppSettings.setGeminiTranslation(keyInput.trim(), modelInput.trim())\n"
+                  "                    GeminiUsageStore.setUseAi(useAiInput)\n"
+                  "                    GeminiUsageStore.setDailyLimit(limitInput.toLongOrNull() ?: 0L)\n"
+                  "                    showGeminiDialog = false\n",
+                  "nút Lưu",
+              )
+              check(src, ["gemini_use_ai", "gemini_daily_limit", "GeminiUsageStore.setDailyLimit", "gemini_usage_reset"], "SettingsSheet.kt")
+              write(SS, src)
+              print("Đã vá SettingsSheet.kt")
+
+          # =====================================================================================================
+          # 6) Chuỗi giao diện
+          # =====================================================================================================
+          def add_strings(p, entries, replace_hint=None):
+              s = read(p)
+              if entries[0][0] in s:
+                  return
+              if replace_hint:
+                  s, n = re.subn(r'<string name="gemini_translation_hint">.*?</string>',
+                                 lambda m: '<string name="gemini_translation_hint">' + replace_hint + '</string>', s, count=1, flags=re.S)
+                  if n != 1:
+                      sys.exit(f"::error::Không thấy gemini_translation_hint trong {p}")
+              block = "".join(f'    <string name="{k}">{v}</string>\n' for k, v in entries)
+              if s.count("</resources>") != 1:
+                  sys.exit(f"::error::{p} không có đúng một </resources>")
+              s = s.replace("</resources>", block + "</resources>")
+              write(p, s)
+
+
+          APP_RES = path("app", "src", "main", "res")
+          add_strings(
+              os.path.join(APP_RES, "values", "strings.xml"),
+              [
+                  ("gemini_translation_google_only", "Off. Google Translate only"),
+                  ("gemini_usage_today_short", "%1$s tokens today"),
+                  ("gemini_use_ai", "Translate with AI (Gemini)"),
+                  ("gemini_use_ai_hint", "On: the AI translates, and if it fails a separate Google Translate button appears over the lyrics. Off: Google Translate only."),
+                  ("gemini_daily_limit", "Daily token limit (0 = none)"),
+                  ("gemini_usage_title", "Tokens used"),
+                  ("gemini_usage_today", "Today: %1$s tokens (in %2$s, out %3$s), %4$d requests"),
+                  ("gemini_usage_all", "All time: %1$s tokens (in %2$s, out %3$s), %4$d requests"),
+                  ("gemini_usage_last", "Last request: %1$s tokens"),
+                  ("gemini_limit_reached", "Daily limit reached. AI translation is paused until tomorrow or until you raise the limit."),
+                  ("gemini_usage_note", "Counted by this app from Gemini’s replies, per day on this device. Google’s real quota is set by Google and is not shown here."),
+                  ("gemini_usage_reset", "Reset counter"),
+              ],
+              replace_hint="Create a free key at aistudio.google.com/apikey and paste it here. Lyrics are sent to Google’s Gemini API and the key stays on this device. Leave it empty to use Google Translate. If the AI cannot translate a song, a separate Google Translate button appears over the lyrics.",
+          )
+          add_strings(
+              os.path.join(APP_RES, "values-vi", "strings.xml"),
+              [
+                  ("gemini_translation_google_only", "Đang tắt AI. Chỉ dùng Google Dịch"),
+                  ("gemini_usage_today_short", "hôm nay %1$s token"),
+                  ("gemini_use_ai", "Dịch bằng AI (Gemini)"),
+                  ("gemini_use_ai_hint", "Bật: AI dịch, nếu lỗi sẽ hiện nút Google Dịch riêng trên phần lời. Tắt: chỉ dùng Google Dịch."),
+                  ("gemini_daily_limit", "Giới hạn token mỗi ngày (0 = không giới hạn)"),
+                  ("gemini_usage_title", "Token đã dùng"),
+                  ("gemini_usage_today", "Hôm nay: %1$s token (vào %2$s, ra %3$s), %4$d lượt gọi"),
+                  ("gemini_usage_all", "Tổng cộng: %1$s token (vào %2$s, ra %3$s), %4$d lượt gọi"),
+                  ("gemini_usage_last", "Lượt gọi gần nhất: %1$s token"),
+                  ("gemini_limit_reached", "Đã chạm giới hạn ngày. AI tạm dừng dịch đến mai hoặc đến khi bạn nâng giới hạn."),
+                  ("gemini_usage_note", "App tự cộng từ phản hồi của Gemini, tính theo ngày trên máy này. Hạn mức thật do Google quy định và không hiện ở đây."),
+                  ("gemini_usage_reset", "Đặt lại bộ đếm"),
+              ],
+              replace_hint="Tạo mã miễn phí tại aistudio.google.com/apikey rồi dán vào đây. Lời bài hát được gửi tới Gemini API của Google, mã chỉ lưu trên máy này. Để trống thì dùng Google Dịch. Nếu AI không dịch được bài nào, nút Google Dịch riêng sẽ hiện trên phần lời để bạn tự chọn.",
+          )
+
+          UI_RES = path("sharedUi", "src", "commonMain", "composeResources")
+          add_strings(
+              os.path.join(UI_RES, "values", "strings.xml"),
+              [
+                  ("translate_with_google", "Translate with Google"),
+                  ("lyrics_ai_failed", "The AI could not translate this song"),
+                  ("lyrics_ai_limit", "Today’s AI token limit is reached"),
+                  ("lyrics_ai_quota", "The AI is out of quota or busy"),
+                  ("lyrics_ai_key", "The AI key was rejected, check it in Settings"),
+              ],
+          )
+          add_strings(
+              os.path.join(UI_RES, "values-vi", "strings.xml"),
+              [
+                  ("translate_with_google", "Dịch bằng Google Dịch"),
+                  ("lyrics_ai_failed", "AI chưa dịch được bài này"),
+                  ("lyrics_ai_limit", "Đã hết giới hạn token AI hôm nay"),
+                  ("lyrics_ai_quota", "AI hết hạn mức hoặc đang quá tải"),
+                  ("lyrics_ai_key", "Mã AI bị từ chối, kiểm tra trong Cài đặt"),
+              ],
+          )
+          print("Đã thêm chuỗi giao diện (en + vi).")
+
+          # =====================================================================================================
+          # 7) Kiểm tra cuối: mọi mảnh ghép phải có mặt
+          # =====================================================================================================
+          for p, must in [
+              (LT, ["Result.AiFailed", "geminiBudgetLeft", "recordGeminiUsage", "googleOnly"]),
+              (PH, ["translateLyricsWithGoogle", "AiFailed"]),
+              (APH, ["translateLyricsWithGoogle", "googleOnly = true"]),
+              (PL, ["GoogleTranslateChip", "translateWithGoogle", "lyrics_ai_limit"]),
+              (APP, ["GeminiUsageStore.init(this)", "geminiBudgetLeft"]),
+              (SS, ["gemini_use_ai", "GeminiUsageStore.usage"]),
+              (STORE, ["object GeminiUsageStore"]),
+          ]:
+              s = read(p)
+              for m in must:
+                  if m not in s:
+                      sys.exit(f"::error::Kiểm tra cuối: {os.path.relpath(p, ROOT)} thiếu '{m}'.")
+          print("Kiểm tra cuối: đủ.")
+
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary:
+              with open(summary, "a", encoding="utf8") as f:
+                  f.write(
+                      "## Gemini: token + chọn AI/Google + nút Google Dịch riêng\n\n"
+                      "- Đếm token từ usageMetadata của mọi lời gọi Gemini (hôm nay, tổng, lần gần nhất), giới hạn token/ngày tùy chọn\n"
+                      "- Cài đặt, Dịch lời bằng Gemini: công tắc AI/Google Dịch, ô giới hạn ngày, bảng token, nút đặt lại\n"
+                      "- AI lỗi hay hết giới hạn: không tự quay về Google Dịch, hiện nút Google Dịch riêng trên phần lời\n"
+                  )
+          TOKENS_EOF
+          python3 "$RUNNER_TEMP/tokens_patch.py"
+          git status --short | sed 's/^/    /' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Narrow the Automix tempo window (no more fast-forward)
+        env:
+          TEMPO_PERCENT: ${{ inputs.tempo_percent }}
+        run: |
+          cat > "$RUNNER_TEMP/tempo_patch.py" <<'TEMPO_EOF'
+          #!/usr/bin/env python3
+          # Chạy ở thư mục gốc repo, sau khi bản nền đã dựng xong.
+          # Automix beatmatch bằng cách đổi tốc độ phát của bài sắp vào: mặc định từ -10% đến +25%, rồi hạ dần về 1x
+          # mỗi nhịp, nên nghe như nhạc "tua nhanh". Patch này thu hẹp cửa sổ đó (mặc định +-4%); cặp bài lệch BPM nhiều
+          # hơn thì không beatmatch nữa mà rơi về kiểu mix lọc/crossfade có sẵn.
+          import os
+          import re
+          import sys
+
+          ROOT = os.getcwd()
+
+
+          def path(*parts):
+              return os.path.join(ROOT, *parts)
+
+
+          def once(src, old, new, label):
+              n = src.count(old)
+              if n != 1:
+                  sys.exit(f"::error::Vá '{label}': cần đúng 1 chỗ khớp, thấy {n}. Mã nguồn đã khác bản dùng để viết patch.")
+              return src.replace(old, new, 1)
+
+
+          raw = os.environ.get("TEMPO_PERCENT", "4").strip() or "4"
+          try:
+              percent = float(raw.replace(",", "."))
+          except ValueError:
+              sys.exit(f"::error::tempo_percent '{raw}' không phải số.")
+          if not 0.0 <= percent <= 10.0:
+              sys.exit("::error::tempo_percent phải từ 0 đến 10.")
+
+          low = round(1.0 - percent / 100.0, 4)
+          high = round(1.0 + percent / 100.0, 4)
+          # Chỉnh nhịp (phase-lock) nhích tối đa thêm một chút; 0 sẽ chia cho 0 trong CrossfadeController nên có sàn 0.5%.
+          nudge = max(0.005, round(percent * 0.00375, 4))
+          total = round(high + nudge, 4)
+
+          POLICY = path("shared", "src", "commonMain", "kotlin", "com", "music", "bitchord", "playback", "smart", "TransitionPolicy.kt")
+          CTRL = path("app", "src", "main", "java", "com", "music", "bitchord", "playback", "CrossfadeController.kt")
+
+          with open(POLICY, encoding="utf8") as f:
+              s = f.read()
+          if "Bit Dev: tempo window" in s:
+              print("Cửa sổ tốc độ đã được vá, bỏ qua.")
+          else:
+              s = once(
+                  s,
+                  "const val MIN_INCOMING_RATE = 0.9\nconst val MAX_INCOMING_RATE = 1.25\n",
+                  f"// Bit Dev: tempo window narrowed to +-{percent:g}% (was -10% / +25%) so a song never audibly speeds up.\n"
+                  f"const val MIN_INCOMING_RATE = {low}\nconst val MAX_INCOMING_RATE = {high}\n",
+                  "TransitionPolicy: cửa sổ tốc độ",
+              )
+              with open(POLICY, "w", encoding="utf8") as f:
+                  f.write(s)
+
+              with open(CTRL, encoding="utf8") as f:
+                  c = f.read()
+              c = once(c, "        const val NUDGE = 0.03f\n", f"        const val NUDGE = {nudge}f\n", "CrossfadeController: NUDGE")
+              c = once(
+                  c,
+                  "        const val MAX_TOTAL_SPEED_UP = 1.12\n",
+                  f"        const val MAX_TOTAL_SPEED_UP = {total}\n",
+                  "CrossfadeController: MAX_TOTAL_SPEED_UP",
+              )
+              with open(CTRL, "w", encoding="utf8") as f:
+                  f.write(c)
+
+              for p, must in [(POLICY, [f"MAX_INCOMING_RATE = {high}"]), (CTRL, [f"NUDGE = {nudge}f", f"MAX_TOTAL_SPEED_UP = {total}"])]:
+                  with open(p, encoding="utf8") as f:
+                      t = f.read()
+                  for m in must:
+                      if m not in t:
+                          sys.exit(f"::error::Sau khi vá thiếu '{m}' trong {os.path.basename(p)}")
+              print(f"Đã vá tốc độ Automix: bài vào chỉ đổi trong {low}..{high} (+-{percent:g}%), nhích chỉnh nhịp {nudge}, tổng tối đa {total}.")
+
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary:
+              with open(summary, "a", encoding="utf8") as f:
+                  f.write(
+                      "## Automix: hết tua nhanh\n\n"
+                      f"- Cửa sổ tốc độ bài vào: {low}..{high} (trước là 0.9..1.25)\n"
+                      f"- Chỉnh nhịp tối đa thêm {nudge}, tổng không quá {total} (trước 0.03 và 1.12)\n"
+                      "- Cặp bài lệch BPM quá cửa sổ: không beatmatch, dùng kiểu mix lọc/crossfade có sẵn\n"
+                  )
+          TEMPO_EOF
+          python3 "$RUNNER_TEMP/tempo_patch.py"
+
+      - name: Check which repo the app will update from
+        run: |
+          if [ "${{ github.repository }}" != "micdeptrai-bit/Bit-dev" ]; then
+            echo "::warning::Workflow đang chạy trong ${{ github.repository }}, không phải micdeptrai-bit/Bit-dev. App sẽ cập nhật từ repo đang chạy này."
+          fi
+          echo "Bản mới sẽ đăng lên Releases của ${{ github.repository }}; app Bit Dev tự phát hiện lúc mở app." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Pick a build number newer than every existing release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # "Bit Dev APK" dùng run_number của nó làm số bản dựng. Lấy số lớn hơn mọi tag hiện có để versionCode
+          # luôn cao hơn bản đang cài, nếu không Android từ chối cài đè (coi là hạ phiên bản).
+          LAST="$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" --jq '.[].tag_name' 2>/dev/null | grep -oE '[0-9]+$' | sort -n | tail -n 1 || true)"
+          N="$GITHUB_RUN_NUMBER"
+          if [ -n "$LAST" ] && [ "$LAST" -ge "$N" ]; then N=$((LAST + 1)); fi
+          echo "BUILD_N=$N" >> "$GITHUB_ENV"
+          echo "Số bản dựng: $N (số lớn nhất trong các tag trước đó: ${LAST:-không có})" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Patch (rename, version, updater)
+        env:
+          RUN: ${{ env.BUILD_N }}
+        run: |
+          sed -i 's/com\.dev\.bitchord/com.bit.dev/g; s/BitChord Dev/Bit Dev/g' \
+            app/build.gradle.kts app/src/dev/AndroidManifest.xml wearos/build.gradle.kts tv/build.gradle.kts
+          sed -i '/UPDATE_APK_PREFIX/s/BitChord-/Bit-/' app/build.gradle.kts
+          sed -i 's#repos/[A-Za-z0-9_-]*/[A-Za-z0-9_-]*/releases/latest#repos/${{ github.repository }}/releases/latest#' \
+            app/src/main/java/com/music/bitchord/data/AppUpdateChecker.kt
+          python3 - <<'PY'
+          import os, re
+          run = int(os.environ["RUN"])
+          s = open("build.gradle.kts").read()
+          m = re.search(r'(?:bitchordVersionName"\] = |baseVersion = )"([0-9.]+)"', s)
+          ver = f"{m.group(1)}.{run}"
+          s = re.sub(r'extra\["bitchordVersionCode"\][^\n]*', f'extra["bitchordVersionCode"] = {39 + run}', s)
+          s = re.sub(r'extra\["bitchordVersionName"\] = [^\n]*(\n    if [^\n]*)?',
+                     f'extra["bitchordVersionName"] = "{ver}"', s)
+          open("build.gradle.kts", "w").write(s)
+          open(os.environ["GITHUB_ENV"], "a").write(f"VER={ver}\n")
+          PY
+
+      # Neu repo co secret thi dung secret, khong thi dung key dev nhung san ben duoi.
+
+      - name: Setup Secrets (Keystore & local.properties)
+        env:
+          S_LASTFM_KEY: ${{ secrets.LASTFM_API_KEY }}
+          S_LASTFM_SECRET: ${{ secrets.LASTFM_SECRET }}
+          S_LISTEN: ${{ secrets.LISTEN_TOGETHER_SERVER }}
+          S_KS_B64: ${{ secrets.KEYSTORE_BASE64 }}
+          S_KS_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+          S_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          S_KEY_PASS: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          {
+            echo "LASTFM_API_KEY=$S_LASTFM_KEY"
+            echo "LASTFM_SECRET=$S_LASTFM_SECRET"
+            echo "LISTEN_TOGETHER_SERVER=$S_LISTEN"
+          } > local.properties
+          KS_B64="$S_KS_B64"; KS_PASS="$S_KS_PASS"; KEY_ALIAS="$S_KEY_ALIAS"; KEY_PASS="$S_KEY_PASS"
+          if [ -z "$KS_B64" ]; then
+            KS_B64='MIIKNAIBAzCCCd4GCSqGSIb3DQEHAaCCCc8EggnLMIIJxzCCBa4GCSqGSIb3DQEHAaCCBZ8EggWbMIIFlzCCBZMGCyqGSIb3DQEMCgECoIIFQDCCBTwwZgYJKoZIhvcNAQUNMFkwOAYJKoZIhvcNAQUMMCsEFK0fxII8tlxuTGjlPy9OEoOb4zh1AgInEAIBIDAMBggqhkiG9w0CCQUAMB0GCWCGSAFlAwQBKgQQhoPbS2/EH0Iq39/VLBv1jwSCBNAs4rqRA9jwqLChGhVDGNkL8Z49X1qbtTFdYUjeNjsUWKw+0mtXbsRP9lW04ub3pGi0EJYqvppU1/oywxqpsDluz+QQzIBMvhUS3uWEr5CtNGR5Mr+xVRhnU8FkZ+nXGs8+4ifof2PK9B+14LI3V0Z8HUiWz/+iMkvT596xjj9mjtxtSv92s0vTNpZluQMKKqx5Q4Au37uNNHW3Igae9vEU0Ytfh43zD4sVAFuGsg6u4ULtb8zjXhu5UuIV+UljDKnKWZcVmiwGAQ887QMlJGOJDZi7pSP5MOpaT4pYzMCAa23XISYXq2/n7tZMMNKLfXKQOjm9PVTzwQ7ijPgoiLmYGXRz2Vyzvm+rVCvTvLQVTnprxCxVvy4fNGz4lapcrcYIwTiPaGiG+HeVuWNXprZDP9DwRE+quQYIl6V/7bJAQopebKjXttqh3yIUe9U8L5McJ7jZ3D2DxTRntMIOP8heC8ZqT7dZyuP+2Sl9BY74BSQEz5k+h/tfv3a7Mbjcb53isQrgEsrwP7hlf5yNP1RiX+Tug7wbzCD0oqLU+oThGz9ilAjOL1CowWiyYOUur4ZFt+MQn9Ib7E1727fsmM3q1G4k0k5Iie5UNWcINNB1e9b9OIAJzevgVusUdsgYkO06VTN3mGqZOq9d7Qq9HTz/BCnjgJFRu3fmyzHQyiCMN8qH+6C99ePek39L7GJKqYnXZhxWNhO4C7xFEJvy/OyKOzcJFd9e3ZYkg1ChlPoCXkS3G0PeCFZ+s6yr6RxztS0S5QCXjpyYWeJAwE43lmZ8tNaOpfNxqzYrXmtiC5NCPh/wp+GBh80PsfLbO0b4KizbW5QZQJQoKZTu6hBjamF/9GqjTsMuj4gNF1X4cw9WV6K89z+dGoYx8h6whGZMbGJ57txuAo+eG+DiNgBzo6pwoZNNABwc5veksEbuTnAxuG3wuv+91Bb6lHxar+be493NsO6bxBHoFV1yGI44PPvDgGSEUyv36br1axP/ZKlVal6hgsbSHDyzhaoK3NvRdGHB5/GZonXT8zG3PB2vtDb2I/fPd13w/uW22qEoxV/mNC6I1GePYCp85o/47ETv5feQHaEUONAjLvrohooBGLZk0Ovxw4UyQIQuei+i+HjNqugi5BXzUGCd0DnQ/9sUg2ds+ZrsRtoNAQF2ogik/mpaSdft/3Zd1utl2wt6ThchJ4b1ayrmx8H/QNJ7yYG9jvioY0YF9KuN+69wP1Ailq7hrGzglncaN4BbwAgoX2mrfqclY94jcjn6NWtD33Y0XHlWA5WJtkQF4j1hAlVtWKNjm2/ZUjrGIW3luWtBiycO2xxiwj6nEhVCjgbQ3U9rmp8/XYp+hnJOm/4qAMiHKKRToDr2toaRFz5UjyYg0UIp0cNXnD1mP2S2kRAhFBQZXQPRSWdKPURX8C4EfRb/K1m8OiNxO9brvSKzJV6il9+BOoeqCrUHTvRvxcj28ROSKAnv+spaon+t3diyg48zrOmvayC7VJ3Ypn5G7y0Dxi5L8fjuYA/yl4ql3WaEJyoG7GQtu/liq1vrPlR8YCsxhzvtbksoSWogT8LrNI/LW5IsNQwlBgm1Hx8/+Kfn+FpVRCLiPIg3EyocX+QljpbWY9rKQVImf90heiG9ac+feerUqTFAMBsGCSqGSIb3DQEJFDEOHgwAYgBpAHQAZABlAHYwIQYJKoZIhvcNAQkVMRQEElRpbWUgMTc5NDA0OTUzOTY4MTCCBBEGCSqGSIb3DQEHBqCCBAIwggP+AgEAMIID9wYJKoZIhvcNAQcBMGYGCSqGSIb3DQEFDTBZMDgGCSqGSIb3DQEFDDArBBRmjjcNhxpHIeR4BNN+17LtuxnKVgICJxACASAwDAYIKoZIhvcNAgkFADAdBglghkgBZQMEASoEEGbLAv6ZH20ohfUWYPBGBuSAggOAxkBCVVa9dFi6GL/io3Jc4snGmi65ca5wivyubHYCcmQfKKcFW0mV1G/W/WvS9rHqfqSscHe5W5Yzdu+pH2X4A1sGpEi5KVKJLg7BTCTCKu4rbMg5xBHMVu2akp81Y9PrBZ7VYPfahrkQ2dW+JNo6mqCu2RN6H1M5cjODPQL37e/+xlbs9dDPx81t3ImnLc0NhH4qCu882ws/dgUnWVgmtFE/V0iThHebjgNsP5/g/81tm/Vn+Ddu1OOk/xLC37G4s/SrM8b98bIsq3N5IMIHrgppgFLdO2S/1+kFuN6mY3ksS3s9CEbDNiOR/YkzKIMqC7EF1jN+cIE3N8yjUxvY8AN3WBn4j/FSMhE2hv/QoM1v5v5Q6W6IWt0wEw6MqpWuAYHqPbxHRycl109mDeoZbamE6kAKXk6hZJHmS78CFA0gnQjxR1gnGLr6iJ2opxcUbtsEgURGENH6wfuFHZPMEnTBC6dRiimBEsV+Cnfcj0ep+PG7fWlbUz3XXjEtPsna3BsLvPLRwLVGWdJjTOINyHIT40ut0IS+iBa6hzFesQrDUvRoF+N4wvf9aiWfxoetLhLUI/+sBQb0UAtYpaqUN8tJrMn5gPTjCB/ve1kEK6LNHhbemi25OdC9wnP6ak/R+ZofPPBqVrRUMX1XN1Verqg130AZGKAs2cM+hkmmzqzy7gZmh2Hrq4v6S8O5eB+eXHFqjPJ+OKj7zzPYm4Ao+9pnokFnfdvDzWlGl2mV8WHoeafZ7EaYeYW/KGuQGO5N3BFTOYBPlCbSnyF4iQyzv3Kjl9IdHCh/h3kuNs/LiV2pCaBKq8yjONt8K2QrtMW021Uz8C7MpXsprfrKhbPzVP61w3h2/LtaYonU+YWFidDs6NcbHSt0/V5aNDc+e2vcUUx2g1zEW/lsmaNXkyaVaEk1gJ8Mv0nveu+2O9n3r/hvEIMsB6c8RN2zMO+HLJQCx5vT15rLfoji5xyAJ7zJToiVlNGXEPXkFMwYgcPt2MCfGQqHuJSJEwfqTnqnpUvILxoR6SUhURFHEjxC4bfMN5RmrHbIcdLrrtmphhOGnBf0i2wHlSHxvjDdjDWIhjXQksim2Io3bobPfhKa8IWNWUmOnMxWOmgN8PQdVbhTjtF5Rnv7xUu7Bk2NVY+Qucp/2D+uolHxaVnYqkrGxcxd3c550rnhSPtGzhV5Rz+j3LUwTTAxMA0GCWCGSAFlAwQCAQUABCDfwbM/nRPBq7oa0FAlyGkh+317OWYy68aWhoYYmotwdgQUeCNvgbp4HpFAtXAIWXdR1NJdQ/kCAicQ'
+            KS_PASS='M8rnSCC3C4TkChAh'
+            KEY_ALIAS='bitdev'
+            KEY_PASS='M8rnSCC3C4TkChAh'
+          fi
+          echo "$KS_B64" | base64 -d > bitchord-release.jks
+          {
+            echo "storeFile=bitchord-release.jks"
+            echo "storePassword=$KS_PASS"
+            echo "keyAlias=$KEY_ALIAS"
+            echo "keyPassword=$KEY_PASS"
+          } > keystore.properties
+
+      - run: chmod +x gradlew
+      - name: Pre-fetch libusb (GitHub release downloads keep returning 504)
+        run: |
+          # CMake tai libusb 1.0.27 tu trang release cua GitHub luc cau hinh, va trang do dang tra 504.
+          # Thu lan luot: GitHub, SourceForge, kho goi Debian (cung mot file, kiem tra bang ma bam SHA256 ma
+          # CMakeLists da ghim). Het cach thi git clone dung tag v1.0.27 va dong goi lai (khi do bo dong ghim ma bam).
+          D="$HOME/libusb-cache"
+          F="$D/libusb-1.0.27.tar.bz2"
+          SHA="ffaa41d741a8a3bee244ac8e54a72ea05bf2879663c098c82fc5757853441575"
+          GH="https://github.com/libusb/libusb/releases/download/v1.0.27/libusb-1.0.27.tar.bz2"
+          CM=app/src/main/cpp/CMakeLists.txt
+          mkdir -p "$D"
+          OK=0
+          for round in 1 2; do
+            for U in "$GH" \
+                     "https://downloads.sourceforge.net/project/libusb/libusb-1.0/libusb-1.0.27/libusb-1.0.27.tar.bz2" \
+                     "https://deb.debian.org/debian/pool/main/libu/libusb-1.0/libusb-1.0_1.0.27.orig.tar.bz2"; do
+              if curl -fsSL --retry 2 --retry-delay 3 --max-time 120 -o "$F" "$U" \
+                 && echo "$SHA  $F" | sha256sum -c - > /dev/null 2>&1; then
+                echo "Da tai libusb tu: $U"
+                OK=1
+                break 2
+              fi
+              echo "Khong tai duoc (hoac sai ma bam) tu: $U"
+              rm -f "$F"
+            done
+            sleep 15
+          done
+          if [ "$OK" = 1 ]; then
+            sed -i "s#$GH#file://$F#" "$CM"
+          else
+            echo "Ca ba nguon tai deu hong, thu git clone tag v1.0.27"
+            for i in 1 2 3; do
+              rm -rf "$D/libusb-1.0.27"
+              if git clone --depth 1 --branch v1.0.27 https://github.com/libusb/libusb.git "$D/libusb-1.0.27"; then
+                rm -rf "$D/libusb-1.0.27/.git"
+                tar -C "$D" -cjf "$D/libusb-git.tar.bz2" libusb-1.0.27
+                # Ban dong goi lai khong cung ma bam voi ban phat hanh, nen bo dong ghim ma bam.
+                sed -i "s#$GH#file://$D/libusb-git.tar.bz2#; s#URL_HASH SHA256=$SHA)#)#" "$CM"
+                echo "Da dung libusb tu git clone"
+                break
+              fi
+              sleep 20
+            done
+          fi
+          sed -n '/FetchContent_Declare(libusb/,/FetchContent_MakeAvailable(libusb)/p' "$CM"
+
+      - name: Build the dev release APK (thu lai khi GitHub tra loi loi tam thoi)
+        run: |
+          for attempt in 1 2 3; do
+            if ./gradlew assembleDevRelease; then
+              exit 0
+            fi
+            echo "Build attempt $attempt failed"
+            sleep 30
+          done
+          exit 1
+
+      - name: Upload the APK (chỉ khi bật keep_apk_artifact)
+        if: ${{ inputs.keep_apk_artifact }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: bit-dev-gemini-arm64
+          path: app/build/outputs/apk/dev/release/*.apk
+          if-no-files-found: error
+
+      - name: Check the APK updates the installed app (same package, same signature, higher version)
+        if: ${{ inputs.publish_release }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          BT="$(ls -d "$SDK"/build-tools/* 2>/dev/null | sort -V | tail -n 1)"
+          APK="$(ls app/build/outputs/apk/dev/release/*.apk | head -n 1)"
+          if [ -z "$BT" ] || [ ! -x "$BT/aapt2" ] || [ ! -x "$BT/apksigner" ]; then
+            echo "::warning::Không thấy aapt2/apksigner trên runner, bỏ qua bước kiểm tra cập nhật đè."
+            exit 0
+          fi
+          info() { # $1 = apk -> "package versionCode sha256"
+            local line pkg code sha
+            line="$("$BT/aapt2" dump badging "$1" | grep -m1 '^package:')"
+            pkg="$(echo "$line" | sed -E "s/.*name='([^']+)'.*/\1/")"
+            code="$(echo "$line" | sed -E "s/.*versionCode='([0-9]+)'.*/\1/")"
+            sha="$("$BT/apksigner" verify --print-certs "$1" | grep -m1 'certificate SHA-256 digest' | awk '{print $NF}')"
+            echo "$pkg $code $sha"
+          }
+          read -r NEW_PKG NEW_CODE NEW_SHA <<< "$(info "$APK")"
+          echo "APK mới: package=$NEW_PKG versionCode=$NEW_CODE chữ ký=${NEW_SHA:0:16}..."
+          {
+            echo "## Kiểm tra cập nhật đè"
+            echo
+            echo "- APK mới: package \`$NEW_PKG\`, versionCode \`$NEW_CODE\`, chữ ký SHA-256 \`${NEW_SHA:0:16}...\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          PREV_TAG="$(gh release list --limit 1 --json tagName --jq '.[0].tagName' 2>/dev/null || true)"
+          if [ -z "$PREV_TAG" ]; then
+            echo "Chưa có bản nào trên Releases, không có gì để so sánh." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          mkdir -p prev
+          if ! gh release download "$PREV_TAG" --pattern 'Bit-*.apk' --dir prev --clobber 2>/dev/null || ! ls prev/*.apk >/dev/null 2>&1; then
+            echo "::warning::Không tải được APK của $PREV_TAG để so sánh, bỏ qua."
+            exit 0
+          fi
+          read -r OLD_PKG OLD_CODE OLD_SHA <<< "$(info "$(ls prev/*.apk | head -n 1)")"
+          echo "Bản trước ($PREV_TAG): package=$OLD_PKG versionCode=$OLD_CODE chữ ký=${OLD_SHA:0:16}..."
+          echo "- Bản trước \`$PREV_TAG\`: package \`$OLD_PKG\`, versionCode \`$OLD_CODE\`, chữ ký \`${OLD_SHA:0:16}...\`" >> "$GITHUB_STEP_SUMMARY"
+          FAIL=0
+          if [ "$NEW_PKG" != "$OLD_PKG" ]; then
+            echo "::error::Khác package ($NEW_PKG so với $OLD_PKG): Android sẽ coi đây là app MỚI, không cập nhật đè."; FAIL=1
+          fi
+          if [ "$NEW_SHA" != "$OLD_SHA" ]; then
+            echo "::error::Khác chữ ký: Android sẽ từ chối cài đè lên bản cũ."; FAIL=1
+          fi
+          if [ "$NEW_CODE" -le "$OLD_CODE" ]; then
+            echo "::error::versionCode $NEW_CODE không lớn hơn $OLD_CODE: Android coi là hạ phiên bản và từ chối."; FAIL=1
+          fi
+          if [ "$FAIL" = 1 ]; then
+            echo "- KẾT QUẢ: SAI, đã dừng, không đăng bản này." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "- KẾT QUẢ: ĐÚNG, cùng package, cùng chữ ký, versionCode tăng ($OLD_CODE -> $NEW_CODE). Cài đè được." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish GitHub Release
+        if: ${{ inputs.publish_release }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          APK=$(ls app/build/outputs/apk/dev/release/*.apk | head -1)
+          # Tên file phải bắt đầu bằng UPDATE_APK_PREFIX ("Bit-") thì hộp thoại cập nhật trong app mới nhận.
+          cp "$APK" "Bit-v${VER}_arm64-v8a.apk"
+          gh release delete "v${VER}" --cleanup-tag --yes || true
+          gh release create "v${VER}" "Bit-v${VER}_arm64-v8a.apk" \
+            --target "$GITHUB_SHA" --latest --title "Bit Dev v${VER}" \
+            --notes "Build #${{ github.run_number }}: Gemini hiện token đã dùng và giới hạn token mỗi ngày, chọn dịch bằng AI hay Google Dịch, AI lỗi thì có nút Google Dịch riêng trên phần lời, Automix không còn tăng giảm tốc độ nhiều khi chuyển bài. Cùng app Bit Dev (com.bit.dev), cập nhật ngay trong app, không cần tải APK. Cài đặt, Dịch lời bằng Gemini, dán mã API."
+          echo "Đã đăng lên Releases: v${VER}. Mở app Bit Dev để nhận cập nhật ngay trong app." >> "$GITHUB_STEP_SUMMARY"
