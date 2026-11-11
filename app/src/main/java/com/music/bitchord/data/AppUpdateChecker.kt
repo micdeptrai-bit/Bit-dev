@@ -18,6 +18,7 @@ import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonPrimitive
 import okhttp3.Request
 import java.io.File
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * BitChord ships as a sideloaded APK off GitHub Releases rather than through
@@ -42,6 +43,9 @@ object AppUpdateChecker {
 
     private const val CACHE_SUBDIR = "updates"
 
+    /** Shortest gap between two successful checks. */
+    private const val MIN_RECHECK_MS = 10 * 60 * 1000L
+
     private const val LATEST_RELEASE_URL =
         "https://api.github.com/repos/micdeptrai-bit/Bit-dev/releases/latest"
 
@@ -65,21 +69,52 @@ object AppUpdateChecker {
     @Volatile
     private var downloadCancelled = false
 
-    suspend fun check() = withContext(Dispatchers.IO) {
-        runCatching {
-            val request = Request.Builder().url(LATEST_RELEASE_URL).build()
-            val body = Http.client.newCall(request).execute().use { response ->
-                if (!response.isSuccessful) null else response.body?.string()
-            } ?: return@runCatching
-            val release = json.parseToJsonElement(body) as? JsonObject ?: return@runCatching
-            val tag = release["tag_name"]?.jsonPrimitive?.contentOrNull ?: return@runCatching
-            val url = release["html_url"]?.jsonPrimitive?.contentOrNull ?: return@runCatching
-            val apkUrl = apkAssetUrl(release)
-            val notes = release["body"]?.jsonPrimitive?.contentOrNull
-            val latest = tag.removePrefix("v")
-            if (isNewer(latest, BuildConfig.VERSION_NAME)) {
-                _available.value = UpdateInfo(latest, url, apkUrl, notes)
+    /** When the last check that actually got an answer from GitHub finished. */
+    @Volatile
+    private var lastCheckAt = 0L
+
+    /** Two triggers can land together (cold start + onStart); one request is enough. */
+    private val checking = AtomicBoolean(false)
+
+    /**
+     * Asks GitHub for the repo's latest release and publishes it through
+     * [available] when it is newer than the running build.
+     *
+     * Called at cold start and every time the app returns to the foreground
+     * (MainActivity.onStart): the playback service keeps the process alive
+     * for days, so a check that only ran at process start never saw a
+     * release published after it. [MIN_RECHECK_MS] throttles repeats; a
+     * failed check does not count, so the next foreground retries at once.
+     */
+    suspend fun check(force: Boolean = false): Unit = withContext(Dispatchers.IO) {
+        if (!force && System.currentTimeMillis() - lastCheckAt < MIN_RECHECK_MS) return@withContext
+        if (!checking.compareAndSet(false, true)) return@withContext
+        try {
+            runCatching {
+                val request = Request.Builder().url(LATEST_RELEASE_URL).build()
+                val body = Http.client.newCall(request).execute().use { response ->
+                    if (!response.isSuccessful) null else response.body?.string()
+                } ?: return@runCatching
+                val release = json.parseToJsonElement(body) as? JsonObject ?: return@runCatching
+                val tag = release["tag_name"]?.jsonPrimitive?.contentOrNull ?: return@runCatching
+                val url = release["html_url"]?.jsonPrimitive?.contentOrNull ?: return@runCatching
+                val apkUrl = apkAssetUrl(release)
+                val notes = release["body"]?.jsonPrimitive?.contentOrNull
+                val latest = tag.removePrefix("v")
+                lastCheckAt = System.currentTimeMillis()
+                if (isNewer(latest, BuildConfig.VERSION_NAME)) {
+                    // A newer release makes an APK fetched for the old one stale.
+                    val previous = _available.value
+                    if (previous != null && previous.version != latest &&
+                        _download.value !is DownloadState.Downloading
+                    ) {
+                        _download.value = DownloadState.Idle
+                    }
+                    _available.value = UpdateInfo(latest, url, apkUrl, notes)
+                }
             }
+        } finally {
+            checking.set(false)
         }
     }
 

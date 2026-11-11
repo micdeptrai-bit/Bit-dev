@@ -123,6 +123,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.music.bitchord.auth.DiscordLoginScreen
 import com.music.bitchord.auth.SpotifyLoginScreen
@@ -461,6 +462,16 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }
+    }
+
+    /**
+     * Looks for a newer release every time the app comes back to the
+     * foreground, not only at process start (the playback service keeps
+     * the process alive for days). AppUpdateChecker throttles repeats.
+     */
+    override fun onStart() {
+        super.onStart()
+        lifecycleScope.launch { AppUpdateChecker.check() }
     }
 
     /**
@@ -874,7 +885,7 @@ private fun BitChordApp(
     // once-per-launch popup version of the same news. `updateDialogShown`
     // rides out configuration changes on rememberSaveable so a rotation
     // doesn't bring it back — only a fresh launch does.
-    var updateDialogShown by rememberSaveable { mutableStateOf(false) }
+    var updateDialogShown by rememberSaveable { mutableStateOf<String?>(null) }
     var showUpdateDialog by remember { mutableStateOf(false) }
     val updateAvailable by viewModel.updateAvailable.collectAsStateWithLifecycle()
 
@@ -885,9 +896,11 @@ private fun BitChordApp(
      */
     val updateNotice = updateAvailable
 
-    LaunchedEffect(updateNotice) {
-        if (updateNotice != null && !updateDialogShown) {
-            updateDialogShown = true
+    // Keyed by version: a release found while the app is open is news again.
+    LaunchedEffect(updateNotice?.version) {
+        val version = updateNotice?.version
+        if (version != null && updateDialogShown != version) {
+            updateDialogShown = version
             showUpdateDialog = true
         }
     }
