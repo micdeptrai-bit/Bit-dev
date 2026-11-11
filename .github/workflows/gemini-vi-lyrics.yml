@@ -10,24 +10,24 @@ name: Gemini dịch lời sang tiếng Việt - prompt dịch giả (APK)
 # LÀM GÌ:
 #   0. Dựng lại nền: chạy các bước của "automix-manual-mix (2).yml" (nó tự dựng all-in-one rồi áp patch có sẵn
 #      tính năng "Dịch lời bằng Gemini"). Bỏ qua nếu LyricsTranslation.kt trong repo đã có Gemini.
-#   1. Vá LyricsTranslation.kt (bản v2):
-#      - Khi dịch sang TIẾNG VIỆT: prompt dịch giả/lyricist, siết xưng hô: buộc Gemini chốt người hát, người nghe,
-#        cặp xưng hô vào trường "analysis" TRƯỚC khi viết lời, rồi tự soát lại lệch xưng hô. Cho phép biến tấu từ ngữ
-#        bay bổng, hợp ngữ cảnh. Các ngôn ngữ đích khác vẫn dùng prompt tiếng Anh cũ.
-#      - Bước tra cứu: trước khi dịch, hỏi Gemini kèm Google Search (nhận diện bài, câu chuyện, ai hát cho ai, nghĩa
-#        tiếng lóng, cặp xưng hô nên dùng). Một lần cho cả bài, dùng chung cho mọi đoạn. Lỗi/hết giờ thì dịch như cũ.
-#      - Thời gian chờ: dịch 150 giây (nâng cả readTimeout, vì Http.client mặc định chỉ 30 giây), tra cứu 75 giây.
+#   1. Vá LyricsTranslation.kt (bản v3), khi dịch sang TIẾNG VIỆT:
+#      - Prompt dịch giả/lyricist siết xưng hô: Gemini phải chốt người hát, người nghe và MỘT cặp xưng hô (trường
+#        "analysis" + "pair") TRƯỚC khi viết lời. Cho phép biến tấu từ ngữ bay bổng, hợp ngữ cảnh.
+#      - Lượt rà xưng hô: sau khi dịch, một lời gọi riêng chỉ có việc sửa đại từ lệch khỏi cặp đã chốt. Lỗi/hết giờ/lệch
+#        số dòng thì giữ bản dịch đầu. Bài dài chia nhiều đoạn: cặp xưng hô đoạn trước được truyền sang đoạn sau.
+#      - Tra cứu bài hát bằng Google Search (input use_search, mặc định TẮT cho nhanh): nhận diện bài, câu chuyện, ai
+#        hát cho ai, nghĩa tiếng lóng. Một lần cho cả bài. Lỗi/hết giờ thì dịch như cũ.
+#      - Thời gian chờ tối đa: dịch 150 giây (nâng cả readTimeout, vì Http.client mặc định chỉ 30 giây), rà 60 giây,
+#        tra cứu 75 giây. Các ngôn ngữ đích khác vẫn dùng prompt tiếng Anh cũ.
 #      - Dòng Gemini trả về rỗng: giữ dòng gốc thay vì bỏ cả bài rồi rơi về Google Dịch.
 #      - CACHE_VERSION 3 -> 4: bản dịch cũ (làm bằng prompt cũ) không còn được dùng lại.
-#      - safetySettings: HARASSMENT, HATE_SPEECH, SEXUALLY_EXPLICIT, DANGEROUS_CONTENT đều BLOCK_NONE. temperature 0.6.
+#      - safetySettings: HARASSMENT, HATE_SPEECH, SEXUALLY_EXPLICIT, DANGEROUS_CONTENT đều BLOCK_NONE. temperature 0.4.
 #   2. Đổi tên gói/phiên bản/updater y như "Bit Dev APK", build assembleDevRelease, đăng lên Releases.
 #
 # Số bản dựng luôn LỚN HƠN mọi tag hiện có của repo (kể cả tag do "Bit Dev APK" tạo), để versionCode cao hơn bản đang
 # cài và Android cho cài đè. SAU KHI CÀI APK: Cài đặt, "Dịch lời bằng Gemini", dán mã API.
 #
 # CẦN CÓ trong .github/workflows: "automix-manual-mix (2).yml" và "automix-all-in-one (2).yml" (đúng tên, hoặc đổi ở input).
-# Lưu ý: tra cứu bài hát dùng Google Search của Gemini nên tốn thêm một lượt gọi API cho mỗi bài dịch tiếng Việt
-# (chỉ một lần mỗi bài, kết quả dịch được lưu cache).
 
 on:
   workflow_dispatch:
@@ -42,6 +42,10 @@ on:
         default: "automix-all-in-one (2).yml"
       skip_base:
         description: "Bỏ qua bước dựng lại nền (chỉ bật khi repo đã chứa sẵn phần Gemini)"
+        type: boolean
+        default: false
+      use_search:
+        description: "Tra cứu bài hát bằng Google Search trước khi dịch (chính xác hơn nhưng chậm hơn, tốn quota). Tắt = nhanh hơn"
         type: boolean
         default: false
       publish_release:
@@ -132,12 +136,16 @@ jobs:
           REPLAY_EOF
           python3 "$RUNNER_TEMP/replay_base.py"
 
-      - name: Apply the Vietnamese lyricist prompt to Gemini (xưng hô nhất quán + tra cứu bài hát)
+      - name: Apply the Vietnamese lyricist prompt to Gemini (xưng hô nhất quán + lượt rà xưng hô)
         shell: bash
+        env:
+          USE_SEARCH: ${{ inputs.use_search }}
         run: |
           set -euo pipefail
           cat > "$RUNNER_TEMP/vi_prompt.py" <<'VI_EOF'
-          import re, sys
+          import os, re, sys
+
+          USE_SEARCH = os.environ.get("USE_SEARCH", "false").strip().lower() == "true"
 
           PATH = "shared/src/jvmSharedMain/kotlin/com/music/bitchord/data/lyrics/LyricsTranslation.kt"
           src = open(PATH, encoding="utf8").read()
@@ -170,6 +178,11 @@ jobs:
               return start, end, indent
 
 
+          def replace_line(text, needle, lines, what):
+              start, end, indent = line_bounds(text, needle, what)
+              return text[:start] + "".join((indent + l if l else "") + "\n" for l in lines) + text[end:]
+
+
           def insert_before(text, needle, lines, what):
               start, _, indent = line_bounds(text, needle, what)
               return text[:start] + "".join((indent + l if l else "") + "\n" for l in lines) + text[start:]
@@ -185,6 +198,8 @@ jobs:
           # ---------------------------------------------------------------------------------------------
           CONSTS = r'''    private const val GEMINI_MAX_CHARS = 7_000
               private const val GEMINI_CONTEXT_MAX_CHARS = 2_500
+              // Tra cứu bài hát bằng Google Search trước khi dịch: chính xác hơn nhưng chậm hơn và tốn quota (chọn lúc chạy workflow).
+              private const val GEMINI_USE_SEARCH = __USE_SEARCH__
 
               // Lời dịch giả/lyricist tiếng Việt (dùng khi ngôn ngữ đích là tiếng Việt), bản chú trọng xưng hô nhất quán.
               // Phần sau là hợp đồng JSON mà app cần (analysis để chốt xưng hô trước, rồi mỗi dòng gốc một dòng dịch).
@@ -213,8 +228,9 @@ jobs:
                   - Đọc lại toàn bộ các dòng đã dịch. Chỗ nào xưng hô lệch khỏi cặp đã chốt, hoặc sai giới tính, hoặc sai thì, thì sửa ngay.
                   - Đầu ra chỉ gồm lời bài hát đã dịch, không thêm lời giải thích hay mở đầu nào.
               """.trimIndent() + "\n\n" + """
-                  Định dạng bắt buộc của ứng dụng: người dùng gửi một mảng JSON, mỗi phần tử là một dòng lời bài hát. Hãy trả về một đối tượng JSON gồm ba trường theo đúng thứ tự: "analysis", "source", "lines".
-                  - "analysis": viết TRƯỚC, bằng tiếng Việt, tối đa khoảng 120 từ, ghi: người hát là ai (giới tính, vai), hát cho ai và quan hệ giữa hai bên, cặp xưng hô đã chốt cho cả bài và lý do ngắn, các đoạn đổi người nói hoặc đổi đối tượng kèm cặp xưng hô riêng (nếu có), thì chủ đạo. Phần này chỉ để bạn chốt xưng hô, đừng đưa nó vào "lines".
+                  Định dạng bắt buộc của ứng dụng: người dùng gửi một mảng JSON, mỗi phần tử là một dòng lời bài hát. Hãy trả về một đối tượng JSON gồm bốn trường theo đúng thứ tự: "analysis", "pair", "source", "lines".
+                  - "analysis": viết TRƯỚC, bằng tiếng Việt, tối đa khoảng 80 từ, ghi: người hát là ai (giới tính, vai), hát cho ai và quan hệ giữa hai bên, cặp xưng hô đã chốt cho cả bài và lý do ngắn, các đoạn đổi người nói hoặc đổi đối tượng kèm cặp xưng hô riêng (nếu có), thì chủ đạo. Phần này chỉ để bạn chốt xưng hô, đừng đưa nó vào "lines".
+                  - "pair": đúng MỘT cặp xưng hô chủ đạo của cả bài, dạng "người hát tự xưng - gọi người nghe", ví dụ "anh - em" hoặc "tao - mày". Mọi dòng trong "lines" phải bám cặp này (trừ đoạn đổi người nói đã nêu trong "analysis").
                   - "source": mã ISO 639-1 của ngôn ngữ mà bài hát chủ yếu được hát (bỏ qua các dòng ngoại ngữ xen vào).
                   - "lines": mảng các chuỗi đã dịch, bám đúng "analysis". Đúng một chuỗi cho mỗi dòng đầu vào, cùng thứ tự, tuyệt đối không gộp, tách, bỏ hay thêm dòng, không để dòng nào trống.
                   Các dòng hoặc cụm ngôn ngữ khác xen vào bài cũng phải được dịch theo đúng các nguyên tắc trên; chỉ giữ nguyên tiếng đệm thuần túy (oh, yeah, la la la) và những dòng vốn đã là tiếng Việt. Các nguyên tắc trên áp dụng cho nội dung từng chuỗi trong "lines"; không thêm lời giải thích hay mở đầu vào chuỗi nào.
@@ -226,8 +242,16 @@ jobs:
                   Trả lời bằng tiếng Việt, tối đa khoảng 220 từ, gạch đầu dòng ngắn, gồm các mục: Bài hát; Câu chuyện và cảm xúc; Người hát và người nghe (giới tính, quan hệ); Cặp xưng hô tiếng Việt nên dùng (kèm ngoại lệ theo đoạn nếu có); Tiếng lóng, ẩn dụ cần lưu ý (kèm nghĩa).
                   Không dịch lời bài hát và không chép nguyên văn lời bài hát.
               """.trimIndent()
+
+              // Lượt rà xưng hô: một lời gọi riêng, chỉ có một việc là bắt và sửa đại từ lệch khỏi cặp đã chốt.
+              private val GEMINI_REVIEW_INSTRUCTION = """
+                  Bạn là biên tập viên chuyên rà xưng hô cho lời bài hát tiếng Việt. Người dùng gửi một đối tượng JSON gồm "plan" (cặp xưng hô đã chốt cùng phân tích), "original" (các dòng gốc) và "translated" (các dòng đã dịch sang tiếng Việt).
+                  Nhiệm vụ DUY NHẤT của bạn: tìm và sửa mọi chỗ trong "translated" xưng hô lệch khỏi "plan". Đại từ tự xưng, đại từ gọi người nghe và ngôi thứ ba phải nhất quán xuyên suốt, đúng giới tính, trừ đoạn mà "plan" nói rõ là đổi người nói hoặc đổi người nghe. Đối chiếu "original" để hiểu dòng đó đang nói về ai, nói với ai.
+                  Giữ nguyên mọi thứ khác: ý nghĩa, nhịp, vần, tiếng lóng, độ thô, từ ngữ. Chỉ sửa tối thiểu những từ cần sửa. Dòng nào đã đúng thì chép lại y nguyên từng chữ.
+                  Trả về JSON dạng {"lines": [...]}: đúng số dòng của "translated", cùng thứ tự, không dòng nào trống, không thêm giải thích.
+              """.trimIndent()
           '''
-          src = once(src, "    private const val GEMINI_MAX_CHARS = 7_000\n", CONSTS, "hằng GEMINI_MAX_CHARS")
+          src = once(src, "    private const val GEMINI_MAX_CHARS = 7_000\n", CONSTS.replace("__USE_SEARCH__", "true" if USE_SEARCH else "false"), "hằng GEMINI_MAX_CHARS")
 
           # ---------------------------------------------------------------------------------------------
           # 2) Prompt tiếng Anh cũ vẫn dùng cho ngôn ngữ đích khác; chọn prompt theo ngôn ngữ đích
@@ -259,12 +283,19 @@ jobs:
           # ---------------------------------------------------------------------------------------------
           # 3) Schema: thêm "analysis" (đứng đầu) khi dịch tiếng Việt
           # ---------------------------------------------------------------------------------------------
-          src = insert_after(src, 'putJsonObject("properties") {', ['    if (planFirst) putJsonObject("analysis") { put("type", "STRING") }'], 'schema properties')
+          src = insert_after(src, 'putJsonObject("properties") {', [
+              '    if (planFirst) putJsonObject("analysis") { put("type", "STRING") }',
+              '    if (planFirst) putJsonObject("pair") { put("type", "STRING") }',
+          ], 'schema properties')
           # "required" trước (khi 'add(JsonPrimitive("source"))' còn duy nhất), rồi mới chèn propertyOrdering.
-          src = insert_before(src, 'add(JsonPrimitive("source"))', ['if (planFirst) add(JsonPrimitive("analysis"))'], 'required analysis')
+          src = insert_before(src, 'add(JsonPrimitive("source"))', [
+              'if (planFirst) add(JsonPrimitive("analysis"))',
+              'if (planFirst) add(JsonPrimitive("pair"))',
+          ], 'required analysis')
           src = insert_before(src, 'putJsonArray("required") {', [
               'if (planFirst) putJsonArray("propertyOrdering") {',
               '    add(JsonPrimitive("analysis"))',
+              '    add(JsonPrimitive("pair"))',
               '    add(JsonPrimitive("source"))',
               '    add(JsonPrimitive("lines"))',
               '}',
@@ -273,7 +304,7 @@ jobs:
           # ---------------------------------------------------------------------------------------------
           # 4) temperature, safetySettings
           # ---------------------------------------------------------------------------------------------
-          src = once(src, 'put("temperature", 0.3)', 'put("temperature", 0.6)', "temperature")
+          src = once(src, 'put("temperature", 0.3)', 'put("temperature", 0.4)', "temperature")
 
           gm = re.findall(r'^([ \t]*)putJsonObject\("generationConfig"\) \{\n', src, re.M)
           if len(gm) != 1:
@@ -317,16 +348,38 @@ jobs:
               "        .readTimeout(75, TimeUnit.SECONDS)",
               "        .build()",
               "}",
+              "// Lượt rà xưng hô ngắn hơn lượt dịch; hết giờ thì giữ bản dịch đầu.",
+              "private val geminiReviewClient by lazy {",
+              "    geminiClient.newBuilder()",
+              "        .callTimeout(60, TimeUnit.SECONDS)",
+              "        .readTimeout(60, TimeUnit.SECONDS)",
+              "        .build()",
+              "}",
           ], "client Google")
 
           # ---------------------------------------------------------------------------------------------
           # 6) Tra cứu bài hát một lần cho cả bài (mọi đoạn chia nhỏ dùng chung một ghi chú, nên xưng hô khớp nhau)
           # ---------------------------------------------------------------------------------------------
           src = insert_before(src, "val texts = mutableListOf<String>()", [
-              "// Chỉ tiếng Việt cần chốt xưng hô: tra cứu một lần, dùng chung cho mọi đoạn. Lỗi hay hết giờ thì dịch không có ghi chú.",
-              'val context = if (target.startsWith("vi", ignoreCase = true)) researchSong(slots, settings) else null',
+              "// Chỉ tiếng Việt cần chốt xưng hô. Tra cứu (nếu bật) chạy một lần, dùng chung cho mọi đoạn; lỗi hay hết giờ thì dịch không có ghi chú.",
+              'val vietnamese = target.startsWith("vi", ignoreCase = true)',
+              "val context = if (GEMINI_USE_SEARCH && vietnamese) researchSong(slots, settings) else null",
+              "var carried = context",
           ], "researchSong call")
-          src = once(src, "requestGemini(chunk, target, settings)", "requestGemini(chunk, target, settings, context)", "gọi requestGemini")
+          src = replace_line(src, "val answer = requestGemini(chunk, target, settings) ?: return null", [
+              "val first = requestGemini(chunk, target, settings, carried) ?: return null",
+              "// Tiếng Việt: một lượt rà riêng chỉ để bắt lỗi xưng hô. Lỗi hay lệch số dòng thì giữ bản dịch đầu.",
+              "val answer = if (vietnamese && first.plan.isNotBlank()) {",
+              "    reviewPronouns(chunk, first.texts, first.plan, settings)",
+              "        ?.let { GeminiAnswer(it, first.sourceLanguage, first.plan) } ?: first",
+              "} else {",
+              "    first",
+              "}",
+              "// Đoạn sau giữ đúng cặp xưng hô đã chốt ở đoạn trước.",
+              "if (answer.plan.isNotBlank()) {",
+              '    carried = listOfNotNull(context, "XƯNG HÔ ĐÃ CHỐT Ở ĐOẠN TRƯỚC, GIỮ NGUYÊN:\\n" + answer.plan).joinToString("\\n\\n")',
+              "}",
+          ], "gọi requestGemini")
 
           HELPERS = r'''    /** Ghi chú tra cứu nối vào cuối system instruction; không có ghi chú thì giữ nguyên. */
               private fun withSongNotes(instruction: String, notes: String?): String =
@@ -394,8 +447,101 @@ jobs:
               }
 
           '''
+          REVIEW = r'''    /**
+               * Lượt rà xưng hô: một lời gọi riêng, chỉ có một việc là sửa đại từ lệch khỏi cặp đã chốt. Null khi lỗi hay
+               * lệch số dòng, khi đó giữ bản dịch đầu.
+               */
+              private suspend fun reviewPronouns(
+                  original: List<TextSlot>,
+                  translated: List<String>,
+                  plan: String,
+                  settings: GeminiSettings,
+              ): List<String>? {
+                  val payload = buildJsonObject {
+                      put("plan", plan)
+                      putJsonArray("original") { original.forEach { add(JsonPrimitive(it.text)) } }
+                      putJsonArray("translated") { translated.forEach { add(JsonPrimitive(it)) } }
+                  }
+                  val body = buildJsonObject {
+                      putJsonObject("systemInstruction") {
+                          putJsonArray("parts") { addJsonObject { put("text", GEMINI_REVIEW_INSTRUCTION) } }
+                      }
+                      putJsonArray("contents") {
+                          addJsonObject {
+                              put("role", "user")
+                              putJsonArray("parts") { addJsonObject { put("text", payload.toString()) } }
+                          }
+                      }
+                      putJsonArray("safetySettings") {
+                          listOf(
+                              "HARM_CATEGORY_HARASSMENT",
+                              "HARM_CATEGORY_HATE_SPEECH",
+                              "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+                              "HARM_CATEGORY_DANGEROUS_CONTENT",
+                          ).forEach { category ->
+                              addJsonObject {
+                                  put("category", category)
+                                  put("threshold", "BLOCK_NONE")
+                              }
+                          }
+                      }
+                      putJsonObject("generationConfig") {
+                          put("temperature", 0.1)
+                          put("responseMimeType", "application/json")
+                          putJsonObject("responseSchema") {
+                              put("type", "OBJECT")
+                              putJsonObject("properties") {
+                                  putJsonObject("lines") {
+                                      put("type", "ARRAY")
+                                      putJsonObject("items") { put("type", "STRING") }
+                                  }
+                              }
+                              putJsonArray("required") { add(JsonPrimitive("lines")) }
+                          }
+                      }
+                  }
+                  val request = Request.Builder()
+                      .url("$GEMINI_ENDPOINT${geminiModel(settings)}:generateContent")
+                      .header("x-goog-api-key", settings.apiKey.trim())
+                      .header("User-Agent", "BitChord/1.7.1")
+                      .post(body.toString().toRequestBody("application/json".toMediaType()))
+                      .build()
+                  val response = try {
+                      geminiReviewClient.newCall(request).awaitBody()
+                  } catch (cancelled: CancellationException) {
+                      throw cancelled
+                  } catch (_: IOException) {
+                      return null
+                  }
+                  return runCatching {
+                      val root = json.parseToJsonElement(response).jsonObject
+                      val text = root["candidates"]!!.jsonArray[0].jsonObject["content"]!!.jsonObject["parts"]!!.jsonArray
+                          .joinToString("") { it.jsonObject["text"]?.jsonPrimitive?.contentOrNull.orEmpty() }
+                      val lines = json.parseToJsonElement(text).jsonObject["lines"]!!.jsonArray.map { it.jsonPrimitive.content.trim() }
+                      lines.takeIf { it.size == translated.size && it.none { line -> line.isBlank() } }
+                  }.getOrNull()
+              }
+
+          '''
+          HELPERS = HELPERS + REVIEW
           helper_lines = [l[4:] if l.startswith("    ") else l for l in HELPERS.rstrip("\n").split("\n")] + [""]
           src = insert_before(src, "private class GeminiAnswer(", helper_lines, "helpers")
+
+          # ---------------------------------------------------------------------------------------------
+          # 6b) GeminiAnswer mang theo "plan" (cặp xưng hô + phân tích) để lượt rà và các đoạn sau dùng lại
+          # ---------------------------------------------------------------------------------------------
+          src = once(
+              src,
+              "private class GeminiAnswer(val texts: List<String>, val sourceLanguage: String)",
+              "private class GeminiAnswer(val texts: List<String>, val sourceLanguage: String, val plan: String = \"\")",
+              "GeminiAnswer",
+          )
+          src = insert_after(src, 'val source = answer["source"]?.jsonPrimitive?.contentOrNull.orEmpty()', [
+              "val plan = listOfNotNull(",
+              '    answer["pair"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }?.let { "Cặp xưng hô đã chốt: " + it },',
+              '    answer["analysis"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }?.let { "Phân tích: " + it },',
+              ').joinToString("\\n")',
+          ], "đọc plan")
 
           # ---------------------------------------------------------------------------------------------
           # 7) Dòng Gemini trả về rỗng: giữ lại dòng gốc thay vì bỏ cả bài rồi rơi về Google Dịch
@@ -409,7 +555,7 @@ jobs:
           src = once(
               src,
               "GeminiAnswer(translated, source)",
-              "GeminiAnswer(translated.mapIndexed { index, text -> text.ifBlank { slots[index].text } }, source)",
+              "GeminiAnswer(translated.mapIndexed { index, text -> text.ifBlank { slots[index].text } }, source, plan)",
               "dòng rỗng giữ gốc",
           )
 
@@ -430,17 +576,18 @@ jobs:
                   sys.exit(f"::error::Thiếu '{must}' sau khi vá.")
 
           open(PATH, "w", encoding="utf8").write(src)
-          print("Đã vá LyricsTranslation.kt: prompt xưng hô nhất quán (analysis trước), tra cứu bài hát bằng Google Search, "
-                "timeout 150s, dòng rỗng giữ gốc, cache v4, temperature 0.6, safetySettings BLOCK_NONE.")
+          print("Đã vá LyricsTranslation.kt (v3): xưng hô chốt trước (analysis + pair), lượt rà xưng hô riêng, "
+                "timeout 150s, dòng rỗng giữ gốc, cache v4, temperature 0.4, safetySettings BLOCK_NONE.")
           VI_EOF
           python3 "$RUNNER_TEMP/vi_prompt.py"
           {
-            echo "## Gemini dịch lời: prompt dịch giả tiếng Việt v2"
+            echo "## Gemini dịch lời: prompt dịch giả tiếng Việt v3"
             echo
-            echo "- Bước tra cứu bài hát bằng Google Search (timeout 75 giây), ghi chú dùng chung cho mọi đoạn"
-            echo "- Chốt xưng hô vào trường analysis trước khi dịch, tự soát lỗi xưng hô"
-            echo "- Timeout dịch 150 giây (callTimeout và readTimeout)"
-            echo "- temperature = 0.6, safetySettings = BLOCK_NONE (4 mục), cache v4"
+            echo "- Chốt xưng hô trước (analysis + pair), rồi một lượt rà xưng hô riêng sau khi dịch"
+            echo "- Bài dài chia nhiều đoạn: cặp xưng hô đã chốt ở đoạn trước được truyền sang đoạn sau"
+            echo "- Tra cứu bài hát bằng Google Search: ${USE_SEARCH}"
+            echo "- Timeout dịch 150 giây, rà 60 giây, tra cứu 75 giây"
+            echo "- temperature = 0.4, safetySettings = BLOCK_NONE (4 mục), cache v4"
             echo
             git status --short | sed 's/^/    /'
           } >> "$GITHUB_STEP_SUMMARY"
