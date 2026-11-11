@@ -1,0 +1,230 @@
+name: Dọn prompt dịch Gemini cũ (xoá workflow cũ rồi commit)
+
+# Chạy tay: tab Actions -> chọn workflow này -> Run workflow.
+# Dán file này vào .github/workflows/ của repo, chạy MỘT LẦN, xong mới up file gemini-vi-lyrics-lite.yml.
+#
+# LÀM GÌ:
+#   - Xoá gemini-vi-lyrics.yml (prompt v3 bản đầy đủ, bản lite thay thế hoàn toàn).
+#   - Tuỳ chọn: xoá "bit-dev-gemini-update (1).yml" (có bản sao prompt cũ, nhưng cũng là nơi duy nhất có bộ đếm
+#     token, công tắc AI/Google Dịch và chỉnh tempo Automix, nên mặc định KHÔNG xoá).
+#   - Tuỳ chọn: xoá thêm file khác theo tên.
+#   - Commit thẳng lên nhánh đang chạy. Cuối cùng báo file nào VẪN còn prompt cũ (GEMINI_VI/CONTEXT/REVIEW_INSTRUCTION).
+#
+# KHÔNG BAO GIỜ XOÁ (bị chặn cứng): chính workflow này, file lite, "automix-manual-mix (2).yml" và
+# "automix-all-in-one (2).yml". Hai file automix chứa prompt tiếng Anh gốc, nhưng cũng chứa toàn bộ phần Gemini
+# (endpoint, cài đặt, requestGemini); bản lite dựng lại nền từ đó nên xoá là hỏng lite.
+#
+# BẮT BUỘC (trừ khi bật dry_run): secret WORKFLOW_PAT.
+#   GITHUB_TOKEN mặc định không được phép sửa hay xoá file trong .github/workflows, nên cần một token cá nhân:
+#   GitHub, Settings, Developer settings, Personal access tokens.
+#     - Token classic: tick "repo" và "workflow".
+#     - Fine-grained: chọn repo này, quyền Contents = Read and write, Workflows = Read and write.
+#   Rồi vào repo, Settings, Secrets and variables, Actions, New repository secret, tên WORKFLOW_PAT.
+#   Chưa có token thì bật dry_run để xem trước danh sách; hoặc tự xoá file bằng tay trên GitHub web.
+
+on:
+  workflow_dispatch:
+    inputs:
+      delete_vi_lyrics:
+        description: "Xoá gemini-vi-lyrics.yml (prompt v3 bản đầy đủ, bản lite thay thế)"
+        type: boolean
+        default: true
+      delete_update_workflow:
+        description: "Xoá luôn bit-dev-gemini-update (1).yml. Mất bộ đếm token, công tắc AI/Google Dịch, chỉnh tempo Automix. Chỉ bật nếu không cần nữa"
+        type: boolean
+        default: false
+      extra_files:
+        description: "Tên file khác trong .github/workflows cần xoá, cách nhau bằng dấu phẩy (để trống nếu không có)"
+        type: string
+        default: ""
+      keep_file:
+        description: "Tên file lite, được bảo vệ không bao giờ bị xoá"
+        type: string
+        default: "gemini-vi-lyrics-lite.yml"
+      dry_run:
+        description: "Chỉ liệt kê, không xoá, không commit (không cần WORKFLOW_PAT)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: clean-old-gemini-prompts-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  clean:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check the WORKFLOW_PAT secret (fail fast, before checkout)
+        if: ${{ !inputs.dry_run }}
+        env:
+          WORKFLOW_PAT: ${{ secrets.WORKFLOW_PAT }}
+        run: |
+          set -euo pipefail
+          if [ -z "$WORKFLOW_PAT" ]; then
+            echo "::error::Thiếu secret WORKFLOW_PAT. GITHUB_TOKEN mặc định không được xoá hay sửa file trong .github/workflows. Tạo token (classic: tick repo + workflow; fine-grained: Contents + Workflows = Read and write) rồi lưu vào Settings, Secrets and variables, Actions với tên WORKFLOW_PAT. Hoặc bật dry_run để chỉ xem trước."
+            exit 1
+          fi
+          if [ "$WORKFLOW_PAT" != "$(printf '%s' "$WORKFLOW_PAT" | tr -d '[:space:]')" ]; then
+            echo "::error::WORKFLOW_PAT có khoảng trắng hoặc xuống dòng lẫn trong token. Xoá secret rồi dán lại, chỉ dán đúng chuỗi token."
+            exit 1
+          fi
+
+          HDR="$RUNNER_TEMP/pat.headers"
+          BODY="$RUNNER_TEMP/pat.body"
+          CODE="$(curl -sS -o "$BODY" -D "$HDR" -w '%{http_code}' \
+            -H "Authorization: Bearer $WORKFLOW_PAT" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}" || true)"
+
+          case "$CODE" in
+            200) ;;
+            401)
+              echo "::error::WORKFLOW_PAT bị GitHub từ chối (401): token sai, đã hết hạn hoặc đã bị thu hồi. Tạo token mới rồi lưu lại secret."
+              exit 1 ;;
+            403|404)
+              echo "::error::WORKFLOW_PAT không truy cập được repo ${GITHUB_REPOSITORY} (HTTP $CODE). Token fine-grained phải chọn đúng repo này (Repository access) và chủ sở hữu token phải là chủ repo; token classic phải tick 'repo'."
+              exit 1 ;;
+            *)
+              echo "::error::Không kiểm tra được WORKFLOW_PAT (HTTP ${CODE:-trống}). Thử chạy lại."
+              exit 1 ;;
+          esac
+
+          PUSH="$(python3 -c 'import json,sys; print(str((json.load(open(sys.argv[1])).get("permissions") or {}).get("push", False)).lower())' "$BODY")"
+          if [ "$PUSH" != "true" ]; then
+            echo "::error::WORKFLOW_PAT chỉ có quyền đọc repo này. Cần quyền ghi: classic tick 'repo'; fine-grained đặt Contents = Read and write."
+            exit 1
+          fi
+
+          # Token classic báo danh sách scope trong header; thiếu 'workflow' thì push sẽ bị từ chối.
+          SCOPES="$(grep -i '^x-oauth-scopes:' "$HDR" | head -n1 | cut -d: -f2- | tr -d '[:space:]' || true)"
+          if [ -n "$SCOPES" ] && ! printf '%s' ",$SCOPES," | grep -q ',workflow,'; then
+            echo "::error::WORKFLOW_PAT (classic) thiếu scope 'workflow' (đang có: $SCOPES). Tick thêm 'workflow' rồi lưu lại."
+            exit 1
+          fi
+          echo "WORKFLOW_PAT hợp lệ, có quyền ghi repo."
+
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.WORKFLOW_PAT || github.token }}
+
+      - name: Plan which files to delete
+        id: plan
+        shell: bash
+        env:
+          DEL_VI: ${{ inputs.delete_vi_lyrics }}
+          DEL_UPD: ${{ inputs.delete_update_workflow }}
+          EXTRA_FILES: ${{ inputs.extra_files }}
+          KEEP_FILE: ${{ inputs.keep_file }}
+        run: |
+          set -euo pipefail
+          WF=".github/workflows"
+          trim() { local s="$1"; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"; printf '%s' "$s"; }
+
+          SELF="${GITHUB_WORKFLOW_REF#*/.github/workflows/}"
+          SELF="${SELF%%@*}"
+          KEEP="$(trim "$KEEP_FILE")"
+          echo "SELF=$SELF" >> "$GITHUB_ENV"
+          echo "KEEP=$KEEP" >> "$GITHUB_ENV"
+          PROTECT=("$SELF" "$KEEP" "automix-manual-mix (2).yml" "automix-all-in-one (2).yml")
+
+          CAND=()
+          if [ "$DEL_VI" = "true" ]; then CAND+=("gemini-vi-lyrics.yml"); fi
+          if [ "$DEL_UPD" = "true" ]; then CAND+=("bit-dev-gemini-update (1).yml"); fi
+          IFS=',' read -r -a EXTRA <<< "$EXTRA_FILES"
+          for e in "${EXTRA[@]:-}"; do
+            e="$(trim "$e")"
+            if [ -n "$e" ]; then CAND+=("$e"); fi
+          done
+
+          LIST="$RUNNER_TEMP/delete.list"
+          : > "$LIST"
+          {
+            echo "## Dọn prompt Gemini cũ"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          for f in "${CAND[@]:-}"; do
+            if [ -z "$f" ]; then continue; fi
+            case "$f" in
+              */*|*..*) echo "::error::Tên file không hợp lệ: '$f' (chỉ nhập tên file nằm thẳng trong $WF)"; exit 1 ;;
+            esac
+            case "$f" in
+              *.yml|*.yaml) ;;
+              *) echo "::error::'$f' không phải file .yml hoặc .yaml"; exit 1 ;;
+            esac
+            for p in "${PROTECT[@]}"; do
+              if [ "$f" = "$p" ]; then
+                echo "::error::'$f' được bảo vệ, không xoá được (workflow này, file lite, hoặc nền automix mà bản lite cần)."
+                exit 1
+              fi
+            done
+            if [ -f "$WF/$f" ]; then
+              echo "$f" >> "$LIST"
+              echo "- sẽ xoá: \`$f\`" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "- không thấy, bỏ qua: \`$f\`" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+
+          COUNT="$(grep -c . "$LIST" || true)"
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          if [ "$COUNT" = "0" ]; then
+            echo "- Không có file nào để xoá." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Report workflows that still carry the old prompts
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          WF=".github/workflows"
+          LIST="$RUNNER_TEMP/delete.list"
+          LEFT=()
+          for path in "$WF"/*.yml "$WF"/*.yaml; do
+            f="${path##*/}"
+            if [ "$f" = "$SELF" ] || [ "$f" = "$KEEP" ]; then continue; fi
+            if grep -qxF -- "$f" "$LIST"; then continue; fi
+            if grep -qE 'GEMINI_(VI|CONTEXT|REVIEW)_INSTRUCTION' "$path"; then LEFT+=("$f"); fi
+          done
+          {
+            echo
+            if [ "${#LEFT[@]}" -eq 0 ]; then
+              echo "Sau khi dọn: không còn file nào chứa prompt v3 cũ (GEMINI_VI/CONTEXT/REVIEW_INSTRUCTION)."
+            else
+              echo "Sau khi dọn, các file này VẪN còn prompt v3 cũ:"
+              for f in "${LEFT[@]}"; do echo "- \`$f\`"; done
+            fi
+            echo
+            echo "Giữ nguyên có chủ ý: \`automix-manual-mix (2).yml\` và \`automix-all-in-one (2).yml\` (chứa prompt tiếng Anh gốc cùng toàn bộ phần Gemini mà bản lite dựng lại nền từ đó)."
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "${#LEFT[@]}" -gt 0 ]; then
+            echo "Còn prompt cũ trong: ${LEFT[*]}"
+          fi
+
+      - name: Delete and commit
+        if: ${{ !inputs.dry_run && steps.plan.outputs.count != '0' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          LIST="$RUNNER_TEMP/delete.list"
+          while IFS= read -r f; do
+            git rm -q -- ".github/workflows/$f"
+          done < "$LIST"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Dọn prompt dịch Gemini cũ: xoá $(grep -c . "$LIST") workflow cũ"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+          {
+            echo
+            echo "Đã commit và push lên nhánh \`${GITHUB_REF_NAME}\`. Giờ có thể up gemini-vi-lyrics-lite.yml."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Dry run notice
+        if: ${{ inputs.dry_run }}
+        run: |
+          echo >> "$GITHUB_STEP_SUMMARY"
+          echo "Chế độ dry_run: chưa xoá hay commit gì." >> "$GITHUB_STEP_SUMMARY"
