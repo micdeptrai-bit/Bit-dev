@@ -1,0 +1,180 @@
+name: Apply update fix
+
+# Chay tay 1 lan: Actions -> "Apply update fix" -> Run workflow.
+# Tu sua AppUpdateChecker.kt va MainActivity.kt trong repo (app kiem tra cap nhat moi lan mo lai, khong chi luc khoi dong),
+# commit thang vao nhanh hien tai, roi (tuy chon) goi luon "Bit Dev APK" de build.
+# Chay lai nhieu lan khong sao: da sua roi thi bo qua.
+# Luu y: workflow KHONG sua duoc cac file .yml khac (GitHub cam), nen dev-benchmark (1).yml va automix-manual-mix (2).yml
+# van phai tai ban moi len tay.
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_after:
+        description: "Sua xong thi chay luon workflow Bit Dev APK"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Patch the Kotlin sources
+        run: |
+          python3 - <<'PY'
+          import sys
+
+          CHK = "app/src/main/java/com/music/bitchord/data/AppUpdateChecker.kt"
+          ACT = "app/src/main/java/com/music/bitchord/MainActivity.kt"
+
+          def need(cond, msg):
+              if not cond:
+                  sys.exit("::error::" + msg)
+
+          # ---------- AppUpdateChecker.kt ----------
+          s = open(CHK, encoding="utf8").read()
+          if "MIN_RECHECK_MS" in s:
+              print("AppUpdateChecker.kt: da sua truoc do, bo qua")
+          else:
+              old = "import okhttp3.Request\nimport java.io.File\n"
+              need(old in s, "AppUpdateChecker.kt: khong thay khoi import de chen")
+              s = s.replace(old, old + "import java.util.concurrent.atomic.AtomicBoolean\n", 1)
+
+              a = s.index("    suspend fun check() = withContext(Dispatchers.IO) {")
+              b = s.index("    /**\n     * Wipes any APK left over")
+              new_check = '''    /** When the last check that actually got an answer from GitHub finished. */
+              @Volatile
+              private var lastCheckAt = 0L
+
+              /** Two triggers can land together (cold start + onStart); one request is enough. */
+              private val checking = AtomicBoolean(false)
+
+              /**
+               * Asks GitHub for the repo's latest release and publishes it through
+               * [available] when it is newer than the running build.
+               *
+               * Called at cold start and every time the app returns to the foreground
+               * (MainActivity.onStart): the playback service keeps the process alive
+               * for days, so a check that only ran at process start never saw a
+               * release published after it. [MIN_RECHECK_MS] throttles repeats; a
+               * failed check does not count, so the next foreground retries at once.
+               */
+              suspend fun check(force: Boolean = false): Unit = withContext(Dispatchers.IO) {
+                  if (!force && System.currentTimeMillis() - lastCheckAt < MIN_RECHECK_MS) return@withContext
+                  if (!checking.compareAndSet(false, true)) return@withContext
+                  try {
+                      runCatching {
+                          val request = Request.Builder().url(LATEST_RELEASE_URL).build()
+                          val body = Http.client.newCall(request).execute().use { response ->
+                              if (!response.isSuccessful) null else response.body?.string()
+                          } ?: return@runCatching
+                          val release = json.parseToJsonElement(body) as? JsonObject ?: return@runCatching
+                          val tag = release["tag_name"]?.jsonPrimitive?.contentOrNull ?: return@runCatching
+                          val url = release["html_url"]?.jsonPrimitive?.contentOrNull ?: return@runCatching
+                          val apkUrl = apkAssetUrl(release)
+                          val notes = release["body"]?.jsonPrimitive?.contentOrNull
+                          val latest = tag.removePrefix("v")
+                          lastCheckAt = System.currentTimeMillis()
+                          if (isNewer(latest, BuildConfig.VERSION_NAME)) {
+                              // A newer release makes an APK fetched for the old one stale.
+                              val previous = _available.value
+                              if (previous != null && previous.version != latest &&
+                                  _download.value !is DownloadState.Downloading
+                              ) {
+                                  _download.value = DownloadState.Idle
+                              }
+                              _available.value = UpdateInfo(latest, url, apkUrl, notes)
+                          }
+                      }
+                  } finally {
+                      checking.set(false)
+                  }
+              }
+
+          '''
+              s = s[:a] + new_check + s[b:]
+
+              c = '    private const val CACHE_SUBDIR = "updates"\n'
+              need(c in s, "AppUpdateChecker.kt: khong thay CACHE_SUBDIR")
+              s = s.replace(c, c + "\n    /** Shortest gap between two successful checks. */\n    private const val MIN_RECHECK_MS = 10 * 60 * 1000L\n", 1)
+              open(CHK, "w", encoding="utf8").write(s)
+              print("AppUpdateChecker.kt: da sua")
+
+          # ---------- MainActivity.kt ----------
+          s = open(ACT, encoding="utf8").read()
+          if "override fun onStart()" in s and "AppUpdateChecker.check()" in s:
+              print("MainActivity.kt: da sua truoc do, bo qua")
+          else:
+              imp = "import androidx.lifecycle.compose.collectAsStateWithLifecycle\n"
+              need(imp in s, "MainActivity.kt: khong thay import collectAsStateWithLifecycle")
+              s = s.replace(imp, imp + "import androidx.lifecycle.lifecycleScope\n", 1)
+
+              marker = "\n    }\n\n    /**\n     * The volume keys move the DAC's own volume"
+              need(s.count(marker) == 1, "MainActivity.kt: khong thay cho chen onStart (sau onCreate)")
+              add = (
+                  "\n    }\n\n"
+                  "    /**\n"
+                  "     * Looks for a newer release every time the app comes back to the\n"
+                  "     * foreground, not only at process start (the playback service keeps\n"
+                  "     * the process alive for days). AppUpdateChecker throttles repeats.\n"
+                  "     */\n"
+                  "    override fun onStart() {\n"
+                  "        super.onStart()\n"
+                  "        lifecycleScope.launch { AppUpdateChecker.check() }\n"
+                  "    }\n\n"
+                  "    /**\n     * The volume keys move the DAC's own volume"
+              )
+              s = s.replace(marker, add, 1)
+
+              old1 = "    var updateDialogShown by rememberSaveable { mutableStateOf(false) }"
+              need(old1 in s, "MainActivity.kt: khong thay updateDialogShown")
+              s = s.replace(old1, "    var updateDialogShown by rememberSaveable { mutableStateOf<String?>(null) }", 1)
+
+              old2 = ("    LaunchedEffect(updateNotice) {\n"
+                      "        if (updateNotice != null && !updateDialogShown) {\n"
+                      "            updateDialogShown = true\n"
+                      "            showUpdateDialog = true\n"
+                      "        }\n"
+                      "    }")
+              need(old2 in s, "MainActivity.kt: khong thay LaunchedEffect(updateNotice)")
+              new2 = ("    // Keyed by version: a release found while the app is open is news again.\n"
+                      "    LaunchedEffect(updateNotice?.version) {\n"
+                      "        val version = updateNotice?.version\n"
+                      "        if (version != null && updateDialogShown != version) {\n"
+                      "            updateDialogShown = version\n"
+                      "            showUpdateDialog = true\n"
+                      "        }\n"
+                      "    }")
+              s = s.replace(old2, new2, 1)
+              open(ACT, "w", encoding="utf8").write(s)
+              print("MainActivity.kt: da sua")
+          PY
+
+      - name: Commit and push
+        id: commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app/src/main/java/com/music/bitchord/data/AppUpdateChecker.kt app/src/main/java/com/music/bitchord/MainActivity.kt
+          if git diff --cached --quiet; then
+            echo "Khong co gi de commit (da sua tu truoc)." | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            git commit -m "App kiem tra cap nhat moi lan mo lai (onStart) + popup theo phien ban"
+            git push
+            echo "Da commit len $GITHUB_REF_NAME." | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # Push bang GITHUB_TOKEN khong tu kich hoat workflow khac, nen goi tay.
+      - name: Run Bit Dev APK
+        if: ${{ inputs.build_after }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run "Bit Dev APK" --ref "$GITHUB_REF_NAME"
+          echo "Da goi workflow Bit Dev APK." | tee -a "$GITHUB_STEP_SUMMARY"
