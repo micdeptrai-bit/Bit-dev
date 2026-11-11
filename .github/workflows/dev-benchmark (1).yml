@@ -15,6 +15,12 @@ on:
 permissions:
   contents: write
 
+# Cung nhom voi automix-manual-mix: hai workflow nay cung dang len Releases va cung tinh "so ban ke tiep",
+# nen phai chay lan luot, khong chay song song (neu khong co the cung chon mot so ban va de len nhau).
+concurrency:
+  group: bit-release
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -94,27 +100,41 @@ jobs:
           PY
 
       # Doi ten + version ngay luc build, khong can sua file nao khac.
+      #
+      # So ban ke tiep N = so lon nhat trong MOI tag release dang vX.Y.Z.N cua repo + 1 (automix-manual-mix tinh
+      # y het the). Truoc day workflow nay dung github.run_number, la bo dem RIENG cua no: sau khi manual-mix dang
+      # v1.9.1.20 thi lan chay #5 o day lai dang v1.9.1.5, nho hon ban dang cai -> app khong bao cap nhat va
+      # Android tu choi cai de (versionCode thap hon).
       - name: Patch (rename, version, updater)
         env:
-          RUN: ${{ github.run_number }}
+          GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           sed -i 's/com\.dev\.bitchord/com.bit.dev/g; s/BitChord Dev/Bit Dev/g' \
             app/build.gradle.kts app/src/dev/AndroidManifest.xml wearos/build.gradle.kts tv/build.gradle.kts
           sed -i '/UPDATE_APK_PREFIX/s/BitChord-/Bit-/' app/build.gradle.kts
-          sed -i 's#repos/[A-Za-z0-9_-]*/[A-Za-z0-9_-]*/releases/latest#repos/${{ github.repository }}/releases/latest#' \
+          sed -i "s#repos/[A-Za-z0-9_.-]*/[A-Za-z0-9_.-]*/releases/latest#repos/${GITHUB_REPOSITORY}/releases/latest#" \
             app/src/main/java/com/music/bitchord/data/AppUpdateChecker.kt
-          python3 - <<'PY'
-          import os, re
-          run = int(os.environ["RUN"])
-          s = open("build.gradle.kts").read()
-          m = re.search(r'(?:bitchordVersionName"\] = |baseVersion = )"([0-9.]+)"', s)
-          ver = f"{m.group(1)}.{run}"
-          s = re.sub(r'extra\["bitchordVersionCode"\][^\n]*', f'extra["bitchordVersionCode"] = {39 + run}', s)
-          s = re.sub(r'extra\["bitchordVersionName"\] = [^\n]*(\n    if [^\n]*)?',
-                     f'extra["bitchordVersionName"] = "{ver}"', s)
-          open("build.gradle.kts", "w").write(s)
-          open(os.environ["GITHUB_ENV"], "a").write(f"VER={ver}\n")
-          PY
+          grep -q "repos/${GITHUB_REPOSITORY}/releases/latest" app/src/main/java/com/music/bitchord/data/AppUpdateChecker.kt
+
+          BASE="$(grep -oP 'bitchordVersionName"\] = "\K[0-9]+(\.[0-9]+)*' build.gradle.kts)"
+          CODE="$(grep -oP 'bitchordVersionCode"\] = \K[0-9]+' build.gradle.kts)"
+          # Loi goi API thi dung han (khong doan so), de khong dang nham mot ban thap hon ban dang cai.
+          TAGS="$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" --paginate --jq '.[].tag_name')"
+          MAX=0
+          while IFS= read -r T; do
+            if [[ "$T" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+\.([0-9]+)$ ]]; then
+              X=$(( 10#${BASH_REMATCH[1]} ))
+              if (( X > MAX )); then MAX=$X; fi
+            fi
+          done <<< "$TAGS"
+          N=$(( MAX + 1 ))
+          if (( N < GITHUB_RUN_NUMBER )); then N=$GITHUB_RUN_NUMBER; fi
+          VER="${BASE}.${N}"
+          sed -i "s#\(bitchordVersionName\"\] = \"\)[^\"]*#\1${VER}#; s#\(bitchordVersionCode\"\] = \)[0-9]*#\1$((CODE + N))#" build.gradle.kts
+          grep -q "bitchordVersionName\"\] = \"${VER}\"" build.gradle.kts
+          echo "VER=${VER}" >> "$GITHUB_ENV"
+          echo "Phien ban app: ${VER} (versionCode $((CODE + N)); so lon nhat truoc do: ${MAX})" >> "$GITHUB_STEP_SUMMARY"
 
       # Neu repo co secret thi dung secret, khong thi dung key dev nhung san ben duoi.
       - name: Setup Secrets (Keystore & local.properties)
@@ -205,13 +225,30 @@ jobs:
           done
           exit 1
 
+      # Chi de nhin: in ten goi, versionCode va dau van tay khoa ky cua APK vua build. Cai de duoc khi va chi khi
+      # ten goi + khoa ky giong ban dang cai va versionCode cao hon. "Khong cai duoc / xung dot goi" = dau van tay doi.
+      - name: Show package, version and signing key of the APK
+        continue-on-error: true
+        run: |
+          APK=$(ls app/build/outputs/apk/dev/release/*.apk | head -1)
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          {
+            echo "### APK vua build"
+            echo '```'
+            "$BT/aapt2" dump badging "$APK" | grep -E "^package:" | cut -c1-200
+            "$BT/apksigner" verify --print-certs "$APK" | grep -E "certificate SHA-256" | head -1
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           APK=$(ls app/build/outputs/apk/dev/release/*.apk | head -1)
           cp "$APK" "Bit-v${VER}_arm64-v8a.apk"
-          gh release delete "v${VER}" --cleanup-tag --yes || true
+          gh release delete "v${VER}" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes || true
+          # --latest: app hoi "releases/latest", nen ban vua dang phai la ban moi nhat.
           gh release create "v${VER}" "Bit-v${VER}_arm64-v8a.apk" \
-            --target "$GITHUB_SHA" --title "Bit Dev v${VER}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" --latest --title "Bit Dev v${VER}" \
             --notes "Build #${{ github.run_number }}"
