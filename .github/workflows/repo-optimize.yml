@@ -24,10 +24,13 @@ name: "Tối ưu & dọn rác repo (ảnh lossless, file rác, runs/cache/artifa
 #     Cố ý KHÔNG bật org.gradle.parallel vì project có task tự viết, chưa kiểm chứng được.
 #
 # JOB 3 - release (build + đăng Release để app tự cập nhật, không cần ký/cài tay)
-#   * Sau khi dọn xong, gọi workflow "Bit Dev APK" (dev-benchmark (1).yml). Workflow đó tự build, tự ký bằng
-#     khoá dev có sẵn trong file của nó, tự tính số bản kế tiếp rồi đăng Release mới (--latest).
-#     Không cần tạo keystore hay thêm secret nào. Dùng đúng workflow đó nên cùng khoá ký -> app đang cài
-#     cập nhật đè được, không phải gỡ ra cài lại.
+#   * Sau khi dọn xong, gọi MỘT workflow build có sẵn (chọn ở ô release_workflow). Workflow đó tự build, tự ký
+#     bằng khoá dev có sẵn trong file của nó, tự tính số bản kế tiếp rồi đăng Release mới (--latest).
+#     Không cần tạo keystore hay thêm secret nào. Cùng khoá ký nên app đang cài cập nhật đè được.
+#   * QUAN TRỌNG: tính năng Gemini dịch lời KHÔNG nằm trong main, nó được dựng bằng patch bên trong workflow Gemini.
+#     "Bit Dev APK" build từ main + automix nên KHÔNG có bản prompt Gemini tiết kiệm token. Vì vậy mặc định ở đây là
+#     workflow Gemini tiết kiệm token (đúng cái đã tạo bản đang cài); chọn "Bit Dev APK" nếu muốn bản không có
+#     phần Gemini v3.
 #   * App mở lại (onStart) là hỏi releases/latest, thấy bản mới thì hiện popup -> tải -> cài (Android vẫn hiện
 #     màn hình xác nhận cài của hệ thống, app thường không cài âm thầm được).
 #   * Có thay đổi và đã đẩy nhánh bot/repo-optimize: build từ nhánh đó. Không có gì thay đổi: build từ nhánh hiện tại.
@@ -90,6 +93,14 @@ on:
         type: choice
         options: [always, if-changed, off]
         default: always
+      release_workflow:
+        description: "Workflow nào build + ký + đăng Release (mặc định: cái đã tạo bản đang cài)"
+        type: choice
+        options:
+          - "Gemini dịch lời sang tiếng Việt - bản tiết kiệm token (APK)"
+          - "Bit Dev - Gemini token + chọn AI/Google Dịch (cập nhật thẳng trong app)"
+          - "Bit Dev APK"
+        default: "Gemini dịch lời sang tiếng Việt - bản tiết kiệm token (APK)"
 
 permissions:
   contents: read
@@ -220,6 +231,7 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       RELEASE: ${{ inputs.release || 'if-changed' }}
+      RELEASE_WF: ${{ inputs.release_workflow || 'Gemini dịch lời sang tiếng Việt - bản tiết kiệm token (APK)' }}
       DO_JUNK: ${{ github.event_name != 'workflow_dispatch' || inputs.clean_junk_files }}
       DO_IMAGES: ${{ github.event_name != 'workflow_dispatch' || inputs.optimize_images }}
       DO_GRADLE: ${{ github.event_name != 'workflow_dispatch' || inputs.gradle_cache }}
@@ -389,7 +401,7 @@ jobs:
             fi
             if [ "$RELEASE" != "off" ] && [ "$APPLY" = "pull-request" ]; then
               echo "### Release"
-              echo "- Sau khi mở PR, workflow gọi \"Bit Dev APK\" build từ nhánh này và đăng Release, app sẽ tự báo cập nhật."
+              echo "- Sau khi mở PR, workflow gọi \"${RELEASE_WF}\" build từ nhánh này và đăng Release, app sẽ tự báo cập nhật."
               echo
             fi
             echo "Merge vào main thì workflow Android Release APK tự build lại để kiểm tra."
@@ -432,10 +444,11 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       MODE: ${{ inputs.release || 'if-changed' }}
+      RELEASE_WF: ${{ inputs.release_workflow || 'Gemini dịch lời sang tiếng Việt - bản tiết kiệm token (APK)' }}
       PUSHED: ${{ needs.repo-optimize.outputs.pushed }}
       BASE: ${{ github.ref_name }}
     steps:
-      - name: Gọi workflow "Bit Dev APK" (build, ký, đăng Release)
+      - name: Gọi workflow build (ký + đăng Release)
         run: |
           set -euo pipefail
           if [ "$PUSHED" = "true" ]; then
@@ -447,14 +460,14 @@ jobs:
             exit 0
           fi
 
-          gh workflow view "Bit Dev APK" --repo "$GITHUB_REPOSITORY" > /dev/null \
-            || { echo "::error::Không thấy workflow \"Bit Dev APK\" (file dev-benchmark (1).yml) trong .github/workflows"; exit 1; }
+          gh workflow view "$RELEASE_WF" --repo "$GITHUB_REPOSITORY" > /dev/null \
+            || { echo "::error::Không thấy workflow \"${RELEASE_WF}\" trong .github/workflows (phải trùng đúng dòng name: của file)"; exit 1; }
 
           # workflow_dispatch bằng GITHUB_TOKEN vẫn kích hoạt được workflow khác (khác với push).
-          gh workflow run "Bit Dev APK" --repo "$GITHUB_REPOSITORY" --ref "$REF"
+          gh workflow run "$RELEASE_WF" --repo "$GITHUB_REPOSITORY" --ref "$REF"
           {
             echo "### Release"
-            echo "Đã gọi **Bit Dev APK** trên nhánh \`${REF}\`. Build xong sẽ tự đăng Release mới (latest)."
-            echo "Xem tiến độ: https://github.com/${GITHUB_REPOSITORY}/actions/workflows/dev-benchmark%20(1).yml"
+            echo "Đã gọi **${RELEASE_WF}** trên nhánh \`${REF}\`. Build xong sẽ tự đăng Release mới (latest)."
+            echo "Xem tiến độ: https://github.com/${GITHUB_REPOSITORY}/actions"
             echo "App tự thấy bản mới khi mở lại (cách nhau tối thiểu 10 phút giữa 2 lần hỏi)."
           } | tee -a "$GITHUB_STEP_SUMMARY"
