@@ -148,6 +148,10 @@ jobs:
           set +e   # runner chạy bash với -e; tắt đi để lệnh ls/grep không tìm thấy gì không làm cả bước chết im lặng
           WANT_PKG="${WANT_PKG:-auto}"
           INST="${INSTALLED_VERSION:-}"; INST="${INST//[[:space:]]/}"; INST="${INST#v}"
+          if [ -n "$INST" ] && ! [[ "$INST" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
+            echo "::error::installed_version '$INST' sai định dạng (ví dụ đúng: 1.9.1.31)."
+            exit 1
+          fi
           SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
           AAPT2="$(ls "$SDK"/build-tools/*/aapt2 2>/dev/null | sort -V | tail -n 1)"
           if [ -z "$AAPT2" ]; then
@@ -169,10 +173,14 @@ jobs:
           REF_PKG=""; REF_CODE=0
           if [ -n "$INST" ] && [ -n "$AAPT2" ]; then
             RD="$RUNNER_TEMP/installed-apk"; rm -rf "$RD"; mkdir -p "$RD"
-            for T in "v$INST" "$INST"; do
-              gh release download "$T" --repo "$GITHUB_REPOSITORY" --pattern 'Bit-*.apk' --dir "$RD" --clobber > /dev/null 2>&1 && break
+            # Thử tag v<ver> và <ver>; không có thì tìm release nào có tag / tên / tên file chứa đúng số phiên bản.
+            TAGS_TRY="v$INST $INST"
+            FOUND_TAG="$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" --paginate --jq '.[] | select(((.tag_name // "") + " " + (.name // "") + " " + ([.assets[].name] | join(" "))) | contains("'"$INST"'")) | .tag_name' 2>/dev/null | head -n 1)"
+            if [ -n "$FOUND_TAG" ]; then TAGS_TRY="$FOUND_TAG $TAGS_TRY"; fi
+            for T in $TAGS_TRY; do
+              gh release download "$T" --repo "$GITHUB_REPOSITORY" --pattern '*.apk' --dir "$RD" --clobber > /dev/null 2>&1 && break
             done
-            RF="$(ls "$RD"/*.apk 2>/dev/null | head -n 1)"
+            RF="$(ls "$RD"/Bit-*.apk "$RD"/*.apk 2>/dev/null | head -n 1)"
             if [ -n "$RF" ]; then
               REF_PKG="$(apk_pkg "$RF")"; REF_CODE="$(apk_code "$RF")"; REF_CODE="${REF_CODE:-0}"
               echo "REF_APK=$RF" >> "$GITHUB_ENV"
@@ -186,7 +194,15 @@ jobs:
           elif [ -n "$REF_PKG" ]; then
             PKG="$REF_PKG"; SRC="đọc từ APK của release v$INST (bản đang cài trên máy)"
           elif [ -n "$INST" ]; then
-            echo "::error::Không thấy release v$INST có file Bit-*.apk để biết app trên máy là gói nào. Sửa installed_version cho đúng, hoặc để trống, hoặc chọn tay package_name."
+            REL="$(gh release list --repo "$GITHUB_REPOSITORY" --limit 30 2>&1 | head -n 40)"
+            echo "Các release hiện có trong repo:"; echo "$REL"
+            {
+              echo "### Không thấy APK của bản đang cài v$INST"
+              echo "Release hiện có trong repo:"
+              echo '```'; echo "$REL"; echo '```'
+              echo "Cách làm: chạy lại và chọn package_name theo TÊN app trên máy: Bit Dev = com.bit.dev | BitChord = com.music.bitchord | BitChord Dev = com.dev.bitchord. Hoặc sửa installed_version cho đúng một phiên bản có trong danh sách trên."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::Không thấy release nào chứa APK của v$INST nên không biết app trên máy là gói nào. Chạy lại và chọn tay package_name (theo tên app trên máy), hoặc sửa installed_version. Danh sách release ở trên và ở Summary."
             exit 1
           fi
 
