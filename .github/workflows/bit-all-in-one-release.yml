@@ -18,26 +18,26 @@ name: "Bit-dev ALL-IN-ONE: Automix + Canvas + Màn hình khóa Liquid Glass v2 +
 #        - Đồng hồ: bỏ 15 kiểu cũ nhạt nhẽo, còn 8 kiểu Liquid Glass: LIQUID, GLASS, LEON (mới), FROSTED, CARDS,
 #          COMPACT, RING, ANALOG. Kiểu đã lưu mà không còn thì tự về LIQUID.
 #   3. Bước 1-3 AI DJ (mix_layer) và bước 4 engine native duy nhất (native_engine)
-#   4. Build APK dev benchmark arm64, ký bằng KHÓA ỔN ĐỊNH, đặt tên Bit-v<ver>_arm64-v8a.apk
+#   4. Build APK arm64 (mặc định bản prod = com.music.bitchord, cùng tên gói với app chính), ký bằng khóa release của repo,
+#      đặt tên Bit-v<ver>_arm64-v8a.apk
 #   5. Tạo GitHub Release (latest) -> app cũ tự thấy bản mới (AppUpdateChecker đọc releases/latest)
 #   6. Xóa release + tag cũ, xóa các lần chạy workflow cũ (và artifact đi kèm)
 #
-# VỀ CẬP NHẬT TỰ ĐỘNG
-#   - App so tag của release mới nhất với versionName đang cài. Workflow tự tăng phiên bản (1.9.1 -> 1.9.2 -> ...)
-#     và ghi vào build, nên mỗi lần chạy đều được app coi là "mới hơn". Ô "version" cho phép đặt tay.
-#   - Android chỉ cho cài đè khi CHỮ KÝ giống bản đang cài. Bản benchmark ký bằng debug key, mà máy chủ GitHub tạo
-#     debug key mới mỗi lần chạy, nên workflow này giữ một khóa cố định:
-#       * có secret UPDATE_KEYSTORE_BASE64 -> dùng khóa đó (cố định vĩnh viễn, nên làm);
-#       * không có -> dùng khóa lưu trong cache của repo (tự tạo ở lần đầu; GitHub xóa cache nếu 7 ngày không chạy);
-#     In vân tay (SHA-256) ở log để bạn kiểm tra khóa không đổi giữa các lần build.
-#   - LẦN ĐẦU: nếu app đang cài được build bởi workflow cũ (khóa ngẫu nhiên đã mất) thì không cài đè được: sao lưu
-#     rồi gỡ app một lần, cài APK mới. Từ lần sau trở đi, cập nhật ngay trong app.
-#
-# TẠO KHÓA CỐ ĐỊNH (làm một lần, tùy chọn, trên máy tính có Java):
-#   keytool -genkeypair -keystore debug.keystore -storepass android -keypass android -alias androiddebugkey \
-#     -keyalg RSA -keysize 2048 -validity 36500 -dname "CN=Android Debug,O=Android,C=US"
-#   base64 -w0 debug.keystore   -> dán vào Settings > Secrets and variables > Actions > UPDATE_KEYSTORE_BASE64
-#   (alias phải là androiddebugkey, mật khẩu android, vì Gradle dùng debug signing config cho bản benchmark)
+# CẬP NHẬT ĐÈ LÊN APP ĐANG DÙNG (không thêm app mới)
+#   Android chỉ cài ĐÈ (giữ nguyên dữ liệu) khi APK mới có CÙNG tên gói và CÙNG chữ ký với bản đang cài.
+#   - Tên gói: chọn app_variant.
+#       prod      = com.music.bitchord        app chính của repo (MẶC ĐỊNH). Đây là bản để cập nhật đè.
+#       dev       = com.dev.bitchord           app "BitChord Dev".
+#       benchmark = com.dev.bitchord.benchmark2  app RIÊNG nằm cạnh app chính, không bao giờ đè được app chính.
+#   - Chữ ký: dùng đúng 4 secret mà android.yml của repo đang dùng:
+#       KEYSTORE_BASE64, KEYSTORE_PASSWORD, KEY_ALIAS, KEY_PASSWORD
+#     Nếu app đang cài được build bằng khóa đó thì bản mới đè được. Thiếu secret: workflow vẫn build và ký bằng khóa dự phòng
+#     (secret UPDATE_KEYSTORE_BASE64, hoặc khóa lưu trong cache của repo), kèm cảnh báo, vì khóa đó CHỈ đè được các bản
+#     do chính workflow này build, không đè được app đã cài từ khóa khác.
+#   - Phiên bản: app so tag của release mới nhất (releases/latest) với versionName đang cài. Workflow tự tăng
+#     (1.9.1 -> 1.9.2 -> ...) và ghi vào build nên bản nào cũng được coi là "mới hơn". Ô "version" cho phép đặt tay.
+#   - Trước khi release, workflow kiểm tra APK: đúng tên gói của app_variant, đúng versionName/versionCode.
+#   - Tên file APK phải bắt đầu bằng "Bit-" và kết thúc _arm64-v8a.apk: đó là cách AppUpdateChecker tìm bản tải.
 #
 # CÔNG TẮC
 #   lockscreen_v2  : dùng màn hình khóa v2. Build Kotlin lỗi ở phần này -> chạy lại với false để có màn hình khóa cũ.
@@ -45,7 +45,8 @@ name: "Bit-dev ALL-IN-ONE: Automix + Canvas + Màn hình khóa Liquid Glass v2 +
 #   echo_cut       : kiểu ECHO_CUT.
 #   native_engine  : MỘT engine native cho mọi chuyển bài (bước 4). Lỗi thì chạy lại với false.
 #   run_tests      : test module shared (fail không chặn build APK).
-#   build_apk      : build APK dev benchmark arm64.
+#   app_variant    : prod (mặc định, cập nhật đè app chính) | dev | benchmark (app riêng).
+#   build_apk      : build APK arm64.
 #   publish_release: tạo release, app tự nhận cập nhật.
 #   keep_old_releases: giữ bao nhiêu release cũ (0 = xóa hết, chỉ còn bản mới).
 #   clean_old_runs : xóa các lần chạy workflow đã xong (mọi workflow, trừ lần này) và artifact của chúng.
@@ -56,6 +57,14 @@ name: "Bit-dev ALL-IN-ONE: Automix + Canvas + Màn hình khóa Liquid Glass v2 +
 on:
   workflow_dispatch:
     inputs:
+      app_variant:
+        description: "Bản build: prod = app chính com.music.bitchord (cập nhật ĐÈ lên app đang dùng) | dev = com.dev.bitchord | benchmark = app riêng com.dev.bitchord.benchmark2"
+        type: choice
+        options:
+          - prod
+          - dev
+          - benchmark
+        default: prod
       lockscreen_v2:
         description: "Màn hình khóa v2: ổn định hơn, Liquid Glass thiết kế lại, đồng hồ mới (có Leon). Tắt nếu build lỗi để về bản cũ"
         type: boolean
@@ -77,7 +86,7 @@ on:
         type: boolean
         default: false
       build_apk:
-        description: "Build APK dev benchmark arm64"
+        description: "Build APK arm64 theo app_variant"
         type: boolean
         default: true
       publish_release:
@@ -6556,11 +6565,16 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@v4
 
+      # Như android.yml: khóa Last.fm và máy chủ Listen Together lấy từ secrets (trống nếu repo không có).
       - name: Write local.properties
+        env:
+          LASTFM_API_KEY: ${{ secrets.LASTFM_API_KEY }}
+          LASTFM_SECRET: ${{ secrets.LASTFM_SECRET }}
+          LISTEN_TOGETHER_SERVER: ${{ secrets.LISTEN_TOGETHER_SERVER }}
         run: |
-          echo "LASTFM_API_KEY=" > local.properties
-          echo "LASTFM_SECRET=" >> local.properties
-          echo "LISTEN_TOGETHER_SERVER=" >> local.properties
+          echo "LASTFM_API_KEY=${LASTFM_API_KEY:-}" > local.properties
+          echo "LASTFM_SECRET=${LASTFM_SECRET:-}" >> local.properties
+          echo "LISTEN_TOGETHER_SERVER=${LISTEN_TOGETHER_SERVER:-}" >> local.properties
 
       - run: chmod +x gradlew
 
@@ -6581,44 +6595,70 @@ jobs:
           path: test.log
           if-no-files-found: ignore
 
-      # ---- Khóa ký ổn định ------------------------------------------------------------
-      # Bản benchmark ký bằng debug key. Máy chủ tạo debug key mới mỗi lần, và Android từ chối cài đè
-      # APK khác chữ ký, nên khóa phải giữ nguyên giữa các lần build.
-      - name: Khôi phục khóa ký từ cache
+      # ---- Khóa ký -----------------------------------------------------------------------
+      # Chữ ký quyết định app có được cài ĐÈ hay không. Ưu tiên khóa release của repo (4 secret KEYSTORE_*, giống
+      # android.yml). Không có thì dùng khóa dự phòng cố định (secret UPDATE_KEYSTORE_BASE64 / cache), vì máy chủ
+      # tạo debug key mới mỗi lần chạy và như vậy ngay cả bản do workflow này build cũng không đè lên nhau được.
+      - name: Khôi phục khóa dự phòng từ cache
         if: ${{ inputs.build_apk }}
         uses: actions/cache@v4
         with:
           path: ~/.android/debug.keystore
           key: bit-update-keystore-v1
 
-      - name: Chuẩn bị khóa ký ổn định
+      - name: Chuẩn bị khóa ký
         id: sign
         if: ${{ inputs.build_apk }}
         shell: bash
         env:
-          KEYSTORE_B64: ${{ secrets.UPDATE_KEYSTORE_BASE64 }}
+          VARIANT: ${{ inputs.app_variant }}
+          RELEASE_KS_B64: ${{ secrets.KEYSTORE_BASE64 }}
+          RELEASE_KS_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          RELEASE_KEY_PASS: ${{ secrets.KEY_PASSWORD }}
+          STABLE_KS_B64: ${{ secrets.UPDATE_KEYSTORE_BASE64 }}
         run: |
           set -euo pipefail
           mkdir -p "$HOME/.android"
           echo "ANDROID_USER_HOME=$HOME/.android" >> "$GITHUB_ENV"
-          KS="$HOME/.android/debug.keystore"
-          if [ -n "${KEYSTORE_B64:-}" ]; then
-            printf '%s' "$KEYSTORE_B64" | base64 -d > "$KS"
-            SRC="secret UPDATE_KEYSTORE_BASE64"
-          elif [ -s "$KS" ]; then
-            SRC="cache của repo"
+          if [ "$VARIANT" != "benchmark" ] && [ -n "${RELEASE_KS_B64:-}" ]; then
+            # Như android.yml: Gradle tự ký bằng signingConfigs.release.
+            printf '%s' "$RELEASE_KS_B64" | base64 -d > bitchord-release.jks
+            {
+              echo "storeFile=bitchord-release.jks"
+              echo "storePassword=$RELEASE_KS_PASS"
+              echo "keyAlias=$RELEASE_KEY_ALIAS"
+              echo "keyPassword=$RELEASE_KEY_PASS"
+            } > keystore.properties
+            KS=bitchord-release.jks; PASS="$RELEASE_KS_PASS"; ALIAS="$RELEASE_KEY_ALIAS"
+            SRC="khóa release của repo (secrets KEYSTORE_*)"
+            MODE="gradle"
           else
-            keytool -genkeypair -keystore "$KS" -storepass android -keypass android -alias androiddebugkey \
-              -keyalg RSA -keysize 2048 -validity 36500 -dname "CN=Android Debug,O=Android,C=US"
-            SRC="khóa mới tạo (lần đầu)"
+            KS="$HOME/.android/debug.keystore"; PASS="android"; ALIAS="androiddebugkey"
+            if [ -n "${STABLE_KS_B64:-}" ]; then
+              printf '%s' "$STABLE_KS_B64" | base64 -d > "$KS"
+              SRC="khóa dự phòng từ secret UPDATE_KEYSTORE_BASE64"
+            elif [ -s "$KS" ]; then
+              SRC="khóa dự phòng trong cache của repo"
+            else
+              keytool -genkeypair -keystore "$KS" -storepass android -keypass android -alias androiddebugkey \
+                -keyalg RSA -keysize 2048 -validity 36500 -dname "CN=Android Debug,O=Android,C=US"
+              SRC="khóa dự phòng mới tạo (lần đầu)"
+            fi
+            # benchmark: Gradle ký bằng debug key (chính là khóa này). prod/dev: Gradle ra APK chưa ký, ký bằng apksigner.
+            if [ "$VARIANT" = "benchmark" ]; then MODE="gradle"; else MODE="apksigner"; fi
+            if [ "$VARIANT" != "benchmark" ]; then
+              echo "::warning::Thiếu secret KEYSTORE_BASE64 (và KEYSTORE_PASSWORD, KEY_ALIAS, KEY_PASSWORD). APK sẽ được ký bằng khóa dự phòng nên CHỈ đè được bản do workflow này build, không đè được app đã cài bằng khóa khác."
+            fi
           fi
-          keytool -list -v -keystore "$KS" -storepass android -alias androiddebugkey > /tmp/ks.txt \
-            || { echo "::error::Khóa ký không hợp lệ: alias phải là androiddebugkey, mật khẩu android"; exit 1; }
+          keytool -list -v -keystore "$KS" -storepass "$PASS" -alias "$ALIAS" > /tmp/ks.txt \
+            || { echo "::error::Khóa ký không mở được: kiểm tra mật khẩu và alias"; exit 1; }
           FP=$(grep -m1 "SHA256:" /tmp/ks.txt | sed 's/^ *//')
-          echo "Nguồn khóa: $SRC"
+          echo "Nguồn khóa: $SRC | cách ký: $MODE"
           echo "Vân tay chứng chỉ: $FP"
           echo "source=$SRC" >> "$GITHUB_OUTPUT"
           echo "fingerprint=$FP" >> "$GITHUB_OUTPUT"
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
 
       # ---- Phiên bản -------------------------------------------------------------------
       # Tag release phải lớn hơn versionName đang cài thì app mới báo cập nhật; versionCode phải tăng thì
@@ -6660,37 +6700,64 @@ jobs:
           echo "code=$CODE" >> "$GITHUB_OUTPUT"
           echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Build APK dev benchmark
+      # Lệnh build ở root giống android.yml: bản release nhúng luôn APK đồng hồ nên cần build cả module wearos.
+      - name: Build APK (theo app_variant)
+        id: build
         if: ${{ inputs.build_apk }}
         shell: bash
+        env:
+          VARIANT: ${{ inputs.app_variant }}
         run: |
           set -o pipefail
-          ./gradlew assembleDevBenchmark 2>&1 | tee -a build.log
-          ls -la app/build/outputs/apk/dev/benchmark/
+          case "$VARIANT" in
+            prod)      TASK=assembleProdRelease;  DIR=app/build/outputs/apk/prod/release;  PKG=com.music.bitchord ;;
+            dev)       TASK=assembleDevRelease;   DIR=app/build/outputs/apk/dev/release;   PKG=com.dev.bitchord ;;
+            benchmark) TASK=assembleDevBenchmark; DIR=app/build/outputs/apk/dev/benchmark; PKG=com.dev.bitchord.benchmark2 ;;
+            *) echo "::error::app_variant không hợp lệ: $VARIANT"; exit 1 ;;
+          esac
+          echo "Build $VARIANT: ./gradlew $TASK (gói $PKG)"
+          echo "pkg=$PKG" >> "$GITHUB_OUTPUT"
+          echo "dir=$DIR" >> "$GITHUB_OUTPUT"
+          ./gradlew "$TASK" 2>&1 | tee -a build.log
+          ls -la "$DIR"
 
       # Tên file là thứ app dùng để tìm APK của mình: bắt đầu bằng "Bit-" (UPDATE_APK_PREFIX) và kết thúc
       # bằng _arm64-v8a.apk (AppUpdateChecker.apkAssetUrl).
-      - name: Đặt tên APK theo chuẩn của bộ cập nhật và kiểm tra
+      - name: Ký (nếu cần), đặt tên APK và kiểm tra gói + phiên bản
         id: apk
         if: ${{ inputs.build_apk }}
         shell: bash
         env:
           VERSION: ${{ steps.ver.outputs.version }}
           CODE: ${{ steps.ver.outputs.code }}
+          PKG: ${{ steps.build.outputs.pkg }}
+          DIR: ${{ steps.build.outputs.dir }}
+          MODE: ${{ steps.sign.outputs.mode }}
         run: |
           set -euo pipefail
-          SRC=$(ls app/build/outputs/apk/dev/benchmark/*arm64-v8a*.apk | head -1)
+          SRC=$(ls "$DIR"/*arm64-v8a*.apk | head -1)
+          echo "APK từ Gradle: $SRC"
           mkdir -p dist
           NAME="Bit-v${VERSION}_arm64-v8a.apk"
-          cp "$SRC" "dist/$NAME"
           BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          if [ "$MODE" = "apksigner" ]; then
+            "$BT/zipalign" -p -f 4 "$SRC" /tmp/aligned.apk
+            "$BT/apksigner" sign --ks "$HOME/.android/debug.keystore" --ks-pass pass:android --key-pass pass:android \
+              --ks-key-alias androiddebugkey --out "dist/$NAME" /tmp/aligned.apk
+          else
+            case "$SRC" in *unsigned*) echo "::error::Gradle ra APK chưa ký dù đã có keystore: $SRC"; exit 1 ;; esac
+            cp "$SRC" "dist/$NAME"
+          fi
+          "$BT/apksigner" verify --print-certs "dist/$NAME" | tee /tmp/certs.txt | grep -i "SHA-256" || true
           "$BT/aapt2" dump badging "dist/$NAME" | grep -E "^package:" | tee /tmp/badging.txt
+          grep -q "name='$PKG'" /tmp/badging.txt || { echo "::error::APK không mang tên gói $PKG: app sẽ không đè được app đang cài"; exit 1; }
           grep -q "versionName='$VERSION'" /tmp/badging.txt || { echo "::error::versionName trong APK không phải $VERSION"; exit 1; }
           grep -q "versionCode='$CODE'" /tmp/badging.txt || { echo "::error::versionCode trong APK không phải $CODE"; exit 1; }
-          "$BT/apksigner" verify --print-certs "dist/$NAME" | grep -i "SHA-256" || true
+          CERT=$(grep -i -m1 "certificate SHA-256" /tmp/certs.txt | sed 's/.*: *//')
           ls -la dist
           echo "name=$NAME" >> "$GITHUB_OUTPUT"
           echo "path=dist/$NAME" >> "$GITHUB_OUTPUT"
+          echo "cert=$CERT" >> "$GITHUB_OUTPUT"
 
       - name: Upload APK arm64
         if: ${{ inputs.build_apk }}
@@ -6714,6 +6781,7 @@ jobs:
           TAG: ${{ steps.ver.outputs.tag }}
           APK_PATH: ${{ steps.apk.outputs.path }}
           APK_NAME: ${{ steps.apk.outputs.name }}
+          PKG: ${{ steps.build.outputs.pkg }}
           EXTRA_NOTES: ${{ inputs.release_notes }}
           LOCK_V2: ${{ inputs.lockscreen_v2 }}
           MIX: ${{ inputs.mix_layer }}
@@ -6737,7 +6805,7 @@ jobs:
               echo "- AI DJ: chọn bài kế tiếp, kiểu cắt quick/drop/echo$( [ "$NATIVE" = "true" ] && echo ', engine native duy nhất cho mọi chuyển bài')."
               echo
             fi
-            echo "_Build tự động từ commit ${GITHUB_SHA:0:7}; các thay đổi trên được áp lúc build._"
+            echo "_Gói ${PKG}. Build tự động từ commit ${GITHUB_SHA:0:7}; các thay đổi trên được áp lúc build._"
           } > notes.md
           # Chạy lại với cùng tag: thay bản cũ.
           gh release delete "$TAG" --cleanup-tag --yes --repo "$GITHUB_REPOSITORY" 2>/dev/null || true
@@ -6816,14 +6884,17 @@ jobs:
           SIGN_SRC: ${{ steps.sign.outputs.source }}
           SIGN_FP: ${{ steps.sign.outputs.fingerprint }}
           REL_URL: ${{ steps.release.outputs.url }}
+          APK_CERT: ${{ steps.apk.outputs.cert }}
         run: |
           {
             echo "### Bit-dev all-in-one"
             echo "- Màn hình khóa v2: ${{ inputs.lockscreen_v2 }} | AI DJ (mix_layer): ${{ inputs.mix_layer }} | Echo cut: ${{ inputs.echo_cut }} | Engine native: ${{ inputs.native_engine }}"
             echo "- Test: ${{ inputs.run_tests }} | APK: ${{ inputs.build_apk }} | Release: ${{ inputs.publish_release }}"
             if [ -n "${VERSION:-}" ]; then echo "- Phiên bản build: **$VERSION** (tag $TAG)"; fi
-            if [ -n "${SIGN_SRC:-}" ]; then echo "- Khóa ký: $SIGN_SRC"; echo "- Vân tay: \`$SIGN_FP\`"; fi
+            echo "- Bản build: ${{ inputs.app_variant }} (gói ${{ steps.build.outputs.pkg }})"
+            if [ -n "${SIGN_SRC:-}" ]; then echo "- Khóa ký: $SIGN_SRC"; echo "- Vân tay khóa: \`$SIGN_FP\`"; fi
+            if [ -n "${APK_CERT:-}" ]; then echo "- Chứng chỉ trong APK (SHA-256): \`$APK_CERT\`"; fi
             if [ -n "${REL_URL:-}" ]; then echo "- Release: $REL_URL"; fi
-            echo "- Nếu app cũ báo lỗi khi cập nhật (\"app not installed\"): bản đang cài ký bằng khóa khác. Sao lưu, gỡ app một lần rồi cài APK mới; các lần sau cập nhật được trong app."
+            echo "- Cập nhật ĐÈ chỉ thành công khi cùng tên gói và cùng chữ ký với app đang cài. Nếu Android báo xung đột hoặc cài thành app thứ hai: kiểm tra app_variant (app chính là prod) và secrets KEYSTORE_*."
             echo "- Logcat: tag BitChordBlendMix, BitChordOverlapMix, BitChordSequencer"
           } >> "$GITHUB_STEP_SUMMARY"
