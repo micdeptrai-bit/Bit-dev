@@ -15,6 +15,8 @@ name: "Bit-dev ALL-IN-ONE: Automix + Canvas + Màn hình khóa Liquid Glass v2 +
 #        - Thiết kế lại giữ nguyên Liquid Glass: kính có thấu kính phóng nhẹ, viền sáng + viền mảnh bên trong, ánh sáng
 #          đọng ở đáy; thẻ điều khiển gộp luôn thanh âm lượng; nút play dạng đĩa kính; công tắc kính; sheet chọn đồng hồ
 #          dạng kính; thanh vuốt mở khóa.
+#        - Mép trên/dưới của ảnh bìa và Canvas mờ dần như màn khóa iOS 26: mép trên chỉ khi đồng hồ hiện, mép dưới chỉ khi
+#          trình phát hiện. Ảnh vuông giữ đúng tỉ lệ theo chiều ngang (không phóng to cắt chủ thể), mép dưới/trên tan vào ảnh nền mờ.
 #        - Đồng hồ: bỏ 15 kiểu cũ nhạt nhẽo, còn 8 kiểu Liquid Glass: LIQUID, GLASS, LEON (mới), FROSTED, CARDS,
 #          COMPACT, RING, ANALOG. Kiểu đã lưu mà không còn thì tự về LIQUID.
 #   3. Bước 1-3 AI DJ (mix_layer) và bước 4 engine native duy nhất (native_engine)
@@ -2211,6 +2213,7 @@ jobs:
           import androidx.compose.foundation.layout.Box
           import androidx.compose.foundation.layout.BoxWithConstraints
           import androidx.compose.foundation.layout.Column
+          import androidx.compose.foundation.layout.aspectRatio
           import androidx.compose.foundation.layout.fillMaxSize
           import androidx.compose.foundation.layout.fillMaxWidth
           import androidx.compose.foundation.layout.height
@@ -2234,11 +2237,14 @@ jobs:
           import androidx.compose.ui.draw.blur
           import androidx.compose.ui.draw.clip
           import androidx.compose.ui.draw.drawBehind
+          import androidx.compose.ui.draw.drawWithContent
           import androidx.compose.ui.draw.shadow
+          import androidx.compose.ui.graphics.BlendMode
           import androidx.compose.ui.graphics.Brush
           import androidx.compose.ui.graphics.Color
           import androidx.compose.ui.graphics.ColorFilter
           import androidx.compose.ui.graphics.ColorMatrix
+          import androidx.compose.ui.graphics.CompositingStrategy
           import androidx.compose.ui.graphics.GraphicsLayerScope
           import androidx.compose.ui.graphics.ImageShader
           import androidx.compose.ui.graphics.ShaderBrush
@@ -2481,6 +2487,19 @@ jobs:
               var bare by remember { mutableStateOf(false) }
               val clockShown = showClockSetting && !bare
               val playerShown = showPlayerSetting && !bare
+              // The soft top and bottom edge (iOS 26 style) is there for the clock and the player and
+              // for nothing else: it follows each one in and out, so with both switched off, or hidden
+              // by a tap on the middle, the picture is left whole.
+              val topBlur by animateFloatAsState(
+                  targetValue = if (clockShown) 1f else 0f,
+                  animationSpec = tween(durationMillis = 320, easing = FastOutSlowInEasing),
+                  label = "lockTopBlur",
+              )
+              val bottomBlur by animateFloatAsState(
+                  targetValue = if (playerShown) 1f else 0f,
+                  animationSpec = tween(durationMillis = 320, easing = FastOutSlowInEasing),
+                  label = "lockBottomBlur",
+              )
 
               // The cover and the Canvas turn in when the track changes: 0 = just changed,
               // 1 = settled. Picking an effect in the sheet replays it as a preview.
@@ -2575,6 +2594,10 @@ jobs:
                       LockBackdrop(
                           url = artworkUrl,
                           fullBleed = fullBleed,
+                          tallCover = tallCover,
+                          aspect = aspect,
+                          top = { topBlur },
+                          bottom = { bottomBlur },
                           onAspect = { coverAspect = it },
                       )
                       if (canvasClip != null) {
@@ -2583,6 +2606,12 @@ jobs:
                               isPlaying = player.isPlaying && active,
                               modifier = Modifier.fillMaxSize(),
                           )
+                      }
+                      // A phone-shaped cover and the Canvas clip both run to the edges of the screen, so
+                      // their soft edge is the blurred copy laid back over them there. (A squarer cover
+                      // dissolves on its own, inside LockBackdrop.)
+                      if (tallCover || canvasClip != null) {
+                          LockEdgeBlur(url = artworkUrl, top = { topBlur }, bottom = { bottomBlur })
                       }
                   }
                   // Keeps the clock and the card legible over any cover. Eased in many
@@ -2845,7 +2874,15 @@ jobs:
            * small — it is about to be blurred anyway — and Coil keeps the aspect.
            */
           @Composable
-          private fun LockBackdrop(url: String?, fullBleed: Boolean, onAspect: (Float) -> Unit) {
+          private fun LockBackdrop(
+              url: String?,
+              fullBleed: Boolean,
+              tallCover: Boolean,
+              aspect: Float?,
+              top: () -> Float,
+              bottom: () -> Float,
+              onAspect: (Float) -> Unit,
+          ) {
               val context = LocalContext.current
               val saturate = remember { ColorFilter.colorMatrix(ColorMatrix().apply { setToSaturation(1.25f) }) }
               Box(Modifier.fillMaxSize()) {
@@ -2862,20 +2899,117 @@ jobs:
                       },
                       modifier = Modifier.fillMaxSize().blur(36.dp),
                   )
+                  // Waits for the proportions: a square cover is laid out differently from a tall one.
                   AnimatedVisibility(
-                      visible = fullBleed,
+                      visible = fullBleed && aspect != null,
                       enter = fadeIn(tween(500)),
                       exit = fadeOut(tween(300)),
                   ) {
-                      AsyncImage(
-                          model = remember(url) {
-                              ImageRequest.Builder(context).data(url).crossfade(400).build()
-                          },
-                          contentDescription = null,
-                          contentScale = ContentScale.Crop,
-                          modifier = Modifier.fillMaxSize(),
-                      )
+                      val sharp = remember(url) {
+                          ImageRequest.Builder(context).data(url).crossfade(400).build()
+                      }
+                      if (tallCover || aspect == null) {
+                          // Made for a phone screen: fills it. Its soft edge is LockEdgeBlur's.
+                          AsyncImage(
+                              model = sharp,
+                              contentDescription = null,
+                              contentScale = ContentScale.Crop,
+                              modifier = Modifier.fillMaxSize(),
+                          )
+                      } else {
+                          // Squarer than a phone: kept at its own proportions across the width, not blown
+                          // up to the height of the screen (which crops the sides off and magnifies it two
+                          // or three times over, so the subject is lost). Its top and bottom edges dissolve
+                          // into the blurred copy behind it, for as long as the clock / the player are up.
+                          Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                              AsyncImage(
+                                  model = sharp,
+                                  contentDescription = null,
+                                  contentScale = ContentScale.Crop,
+                                  modifier = Modifier
+                                      .fillMaxWidth()
+                                      .aspectRatio(aspect)
+                                      .edgeMasked(
+                                          top = top,
+                                          bottom = bottom,
+                                          topFrac = CoverFeatherTop,
+                                          bottomFrac = CoverFeatherBottom,
+                                          invert = true,
+                                      ),
+                              )
+                          }
+                      }
                   }
+              }
+          }
+
+          /** How far in from the top / bottom of the SCREEN the blurred edge reaches (clock / player zone). */
+          private const val EdgeBlurTop = 0.28f
+          private const val EdgeBlurBottom = 0.36f
+
+          /** How far in from the top / bottom of a squarer cover's OWN height it dissolves. */
+          private const val CoverFeatherTop = 0.30f
+          private const val CoverFeatherBottom = 0.34f
+
+          /**
+           * The edge weight along the height: 1 at the very top and bottom (scaled by [top] and [bottom]),
+           * easing to 0 over [topFrac] / [bottomFrac] and staying 0 in between. [invert] turns it into what
+           * to keep (1 - weight) rather than what to lay over. Eased in small steps: two stops would leave
+           * a visible band where the gradient starts.
+           */
+          private fun edgeBrush(top: Float, bottom: Float, topFrac: Float, bottomFrac: Float, invert: Boolean): Brush {
+              val steps = 10
+              fun mask(weight: Float) = Color.Black.copy(alpha = (if (invert) 1f - weight else weight).coerceIn(0f, 1f))
+              val stops = ArrayList<Pair<Float, Color>>()
+              for (i in 0..steps) {
+                  val t = i / steps.toFloat()
+                  stops += (t * topFrac) to mask(top * (1f - smoothstep(t)))
+              }
+              for (i in 0..steps) {
+                  val t = i / steps.toFloat()
+                  stops += (1f - bottomFrac + t * bottomFrac) to mask(bottom * smoothstep(t))
+              }
+              return Brush.verticalGradient(*stops.toTypedArray())
+          }
+
+          /**
+           * Multiplies what is drawn by [edgeBrush]'s alpha, in a layer of its own. [top] and [bottom] are
+           * read while drawing, so the edge easing in or out redraws this and recomposes nothing.
+           */
+          private fun Modifier.edgeMasked(
+              top: () -> Float,
+              bottom: () -> Float,
+              topFrac: Float,
+              bottomFrac: Float,
+              invert: Boolean,
+          ): Modifier = this
+              .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen }
+              .drawWithContent {
+                  drawContent()
+                  drawRect(edgeBrush(top(), bottom(), topFrac, bottomFrac, invert), blendMode = BlendMode.DstIn)
+              }
+
+          /**
+           * The soft copy of the cover, laid over the sharp picture along the top and the bottom of the
+           * screen and fading out inward: the picture, or the Canvas clip, goes soft where the clock and
+           * the player sit. Same decode, scale, blur and saturation as the backdrop's own copy, so where
+           * it is fully opaque it is the backdrop and there is no seam.
+           *
+           * Nothing is drawn into the Canvas clip itself (a video texture does not take a mask the way an
+           * image does); the soft copy goes over it, which looks the same and costs nothing extra.
+           */
+          @Composable
+          private fun LockEdgeBlur(url: String?, top: () -> Float, bottom: () -> Float) {
+              val context = LocalContext.current
+              val saturate = remember { ColorFilter.colorMatrix(ColorMatrix().apply { setToSaturation(1.25f) }) }
+              Box(Modifier.fillMaxSize().edgeMasked(top, bottom, EdgeBlurTop, EdgeBlurBottom, invert = false)) {
+                  AsyncImage(
+                      model = remember(url) { ImageRequest.Builder(context).data(url).size(360, 360).build() },
+                      contentDescription = null,
+                      contentScale = ContentScale.Crop,
+                      colorFilter = saturate,
+                      modifier = Modifier.fillMaxSize().blur(36.dp),
+                  )
               }
           }
 
@@ -6797,6 +6931,7 @@ jobs:
               echo "- Khởi chạy ổn định hơn: kiểm tra lại trạng thái trước khi mở, không mở trùng, tự đóng khi không có nhạc của BitChord, không kẹt màn hình đen."
               echo "- Tiết kiệm pin: dừng video Canvas, đồng hồ và cập nhật vị trí khi màn hình không hiển thị."
               echo "- Thiết kế Liquid Glass mới: thẻ điều khiển kính (gộp thanh âm lượng), nút play dạng đĩa kính, công tắc kính, thanh chọn đồng hồ dạng kính."
+              echo "- Ảnh bìa và Canvas mờ dần ở mép trên (theo đồng hồ) và mép dưới (theo trình phát); tắt đồng hồ / trình phát thì phần mờ tương ứng tắt theo. Ảnh vuông vừa chiều ngang màn hình, không còn phóng to cắt mất chủ thể."
               echo "- Đồng hồ: mới kiểu Leon; 8 kiểu Liquid Glass (Liquid, Glass, Leon, Frosted, Cards, Compact, Ring, Analog). Đã bỏ các kiểu cũ."
               echo
             fi
