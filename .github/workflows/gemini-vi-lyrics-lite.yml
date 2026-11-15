@@ -1,5 +1,14 @@
 name: Gemini dịch lời sang tiếng Việt - xưng hô chuẩn (APK, cập nhật đè)
 
+# BẢN v5 (sửa lỗi "bấm cập nhật trong app lại đẻ thêm một app"):
+#   NGUYÊN NHÂN: workflow này luôn ép tên gói thành com.bit.dev, còn "Bit-dev ALL-IN-ONE" mặc định build com.music.bitchord (bản prod).
+#   Cả hai đều đăng lên CÙNG kênh Releases (--latest) với cùng tiền tố file "Bit-", và hộp thoại cập nhật trong app KHÔNG kiểm tra tên gói,
+#   chỉ tải APK của release mới nhất. Release mới nhất khác tên gói với app đang cài thì Android coi là app KHÁC và cài thành app mới.
+#   CÁCH SỬA: input installed_version (mặc định 1.9.1.31 = bản đang cài). Ngay đầu job, workflow tải APK của release v<installed_version>,
+#   đọc tên gói + versionCode của nó, rồi build đúng gói đó với versionCode cao hơn. Chạy nó không bao giờ đổi tên gói so với app trên máy.
+#   Không tìm thấy release đó thì DỪNG ngay (trước khi build lâu). Để trống installed_version = theo release mới nhất.
+#   Muốn ép tay: input package_name = com.bit.dev / com.music.bitchord / com.dev.bitchord. Chữ ký cũng được so với APK của bản đang cài.
+
 # BẢN v4 của gemini-vi-lyrics-lite.yml: viết lại prompt xưng hô cho Gemini. Cùng cách chạy, cùng APK, cùng cách cài đè.
 #
 # MỚI TRONG BẢN NÀY: MÀN KHOÁ KIỂU iOS 26 (bước "Add the iOS 26 lock screen", chạy sau bước prompt Gemini, trước bước đánh số bản dựng).
@@ -84,6 +93,19 @@ on:
         description: "Giới hạn token suy nghĩ của Gemini. Để trống = không đổi. Gemini Flash: 0 = tắt suy nghĩ (tiết kiệm nhất), 1024 = nhẹ. Gemini Pro: không nhập 0"
         type: string
         default: ""
+      installed_version:
+        description: "Phiên bản app ĐANG CÀI trên máy (vd 1.9.1.31). Workflow đọc tên gói + versionCode từ APK của release v<phiên bản> này để build đúng gói đó, nên cập nhật ĐÈ chứ không đẻ app mới. Để trống = theo release mới nhất"
+        type: string
+        default: "1.9.1.31"
+      package_name:
+        description: "Tên gói của APK. auto = theo installed_version (khuyên dùng, để app cập nhật ĐÈ chứ không đẻ thêm app). Ép tay thì chọn đúng gói của app đang cài: Bit Dev = com.bit.dev | BitChord = com.music.bitchord | BitChord Dev = com.dev.bitchord"
+        type: choice
+        options:
+          - auto
+          - com.bit.dev
+          - com.music.bitchord
+          - com.dev.bitchord
+        default: auto
       publish_release:
         description: "Đăng APK lên mục Releases (cần để app cập nhật trong app được). Tắt = chỉ có file ở Artifacts"
         type: boolean
@@ -112,6 +134,90 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
           cache: gradle
+
+      - name: Decide the package name from the INSTALLED app (sai gói = Android cài thành app MỚI)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WANT_PKG: ${{ inputs.package_name }}
+          INSTALLED_VERSION: ${{ inputs.installed_version }}
+        run: |
+          set -uo pipefail
+          WANT_PKG="${WANT_PKG:-auto}"
+          INST="${INSTALLED_VERSION:-}"; INST="${INST//[[:space:]]/}"; INST="${INST#v}"
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          AAPT2="$(ls "$SDK"/build-tools/*/aapt2 2>/dev/null | sort -V | tail -n 1)"
+          if [ -z "$AAPT2" ]; then
+            echo "::error::Không thấy aapt2 trên runner nên không đọc được tên gói của APK. Chọn tay package_name."
+            [ "$WANT_PKG" = "auto" ] && exit 1
+          fi
+          badge() { "$AAPT2" dump badging "$1" 2>/dev/null; }
+          apk_pkg() { badge "$1" | grep -oP "package: name='\K[^']+" | head -n 1; }
+          apk_code() { badge "$1" | grep -oP "versionCode='\K[0-9]+" | head -n 1; }
+
+          # 1) APK của đúng bản đang cài (release tag v<installed_version>): tên gói + versionCode của app trên máy.
+          REF_PKG=""; REF_CODE=0
+          if [ -n "$INST" ] && [ -n "$AAPT2" ]; then
+            RD="$RUNNER_TEMP/installed-apk"; rm -rf "$RD"; mkdir -p "$RD"
+            for T in "v$INST" "$INST"; do
+              gh release download "$T" --repo "$GITHUB_REPOSITORY" --pattern 'Bit-*.apk' --dir "$RD" --clobber > /dev/null 2>&1 && break
+            done
+            RF="$(ls "$RD"/*.apk 2>/dev/null | head -n 1)"
+            if [ -n "$RF" ]; then
+              REF_PKG="$(apk_pkg "$RF")"; REF_CODE="$(apk_code "$RF")"; REF_CODE="${REF_CODE:-0}"
+              echo "REF_APK=$RF" >> "$GITHUB_ENV"
+            fi
+          fi
+
+          # 2) Chọn gói: chọn tay > gói của bản đang cài > gói của release mới nhất.
+          PKG=""; SRC=""
+          if [ "$WANT_PKG" != "auto" ]; then
+            PKG="$WANT_PKG"; SRC="chọn tay ở input package_name"
+          elif [ -n "$REF_PKG" ]; then
+            PKG="$REF_PKG"; SRC="đọc từ APK của release v$INST (bản đang cài trên máy)"
+          elif [ -n "$INST" ]; then
+            echo "::error::Không thấy release v$INST có file Bit-*.apk để biết app trên máy là gói nào. Sửa installed_version cho đúng, hoặc để trống, hoặc chọn tay package_name."
+            exit 1
+          fi
+
+          # 3) APK của release mới nhất: dùng làm gói dự phòng (khi installed_version để trống) và để biết versionCode cao nhất cùng gói.
+          LAT_PKG=""; LAT_CODE=0
+          if [ -n "$AAPT2" ]; then
+            LD="$RUNNER_TEMP/latest-apk"; rm -rf "$LD"; mkdir -p "$LD"
+            if gh release download --repo "$GITHUB_REPOSITORY" --pattern 'Bit-*.apk' --dir "$LD" --clobber > /dev/null 2>&1; then
+              LF="$(ls "$LD"/*.apk 2>/dev/null | head -n 1)"
+              if [ -n "$LF" ]; then LAT_PKG="$(apk_pkg "$LF")"; LAT_CODE="$(apk_code "$LF")"; LAT_CODE="${LAT_CODE:-0}"; fi
+            fi
+          fi
+          if [ -z "$PKG" ]; then
+            if [ -n "$LAT_PKG" ]; then
+              PKG="$LAT_PKG"; SRC="đọc từ APK của release mới nhất"
+            else
+              PKG="com.bit.dev"; SRC="mặc định (không đọc được APK nào)"
+              echo "::warning::Không đọc được tên gói từ release nào, dùng mặc định com.bit.dev. Nếu app trên máy là gói khác, chạy lại và chọn tay package_name."
+            fi
+          fi
+          if ! [[ "$PKG" =~ ^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$ ]]; then
+            echo "::error::Tên gói '$PKG' không hợp lệ."
+            exit 1
+          fi
+
+          # 4) versionCode phải cao hơn mọi bản cùng gói đã biết (bản đang cài + release mới nhất), nếu không Android báo hạ phiên bản.
+          MAXC=0
+          if [ "$REF_PKG" = "$PKG" ] && (( REF_CODE > MAXC )); then MAXC=$REF_CODE; fi
+          if [ "$LAT_PKG" = "$PKG" ] && (( LAT_CODE > MAXC )); then MAXC=$LAT_CODE; fi
+          MIN_CODE=0; if (( MAXC > 0 )); then MIN_CODE=$(( MAXC + 1 )); fi
+
+          echo "APP_PKG=$PKG" >> "$GITHUB_ENV"
+          echo "MIN_CODE=$MIN_CODE" >> "$GITHUB_ENV"
+          {
+            echo "- Tên gói của APK: $PKG ($SRC). App trên máy phải cùng gói này thì mới cập nhật đè, khác gói là Android cài thêm app mới."
+            echo "- Bản đang cài (installed_version): ${INST:-không khai} | gói đọc được: ${REF_PKG:-?} (versionCode ${REF_CODE}) | release mới nhất: gói ${LAT_PKG:-?} (versionCode ${LAT_CODE}) | versionCode tối thiểu cho bản này: ${MIN_CODE}"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Tên gói: $PKG ($SRC) | versionCode tối thiểu: $MIN_CODE"
+          if [ -n "$REF_PKG" ] && [ -n "$LAT_PKG" ] && [ "$REF_PKG" != "$LAT_PKG" ]; then
+            echo "::warning::Release mới nhất ($LAT_PKG) KHÁC gói bản đang cài ($REF_PKG): có workflow khác đã đăng APK gói khác vào kênh cập nhật. Bản build lần này dùng gói $PKG."
+          fi
 
       - name: Rebuild the base (all-in-one + Gemini translation)
         if: ${{ !inputs.skip_base }}
@@ -1866,7 +1972,7 @@ jobs:
         env:
           RUN: ${{ env.BUILD_N }}
         run: |
-          sed -i 's/com\.dev\.bitchord/com.bit.dev/g; s/BitChord Dev/Bit Dev/g' \
+          sed -i "s/com\.dev\.bitchord/${APP_PKG}/g; s/BitChord Dev/Bit Dev/g" \
             app/build.gradle.kts app/src/dev/AndroidManifest.xml wearos/build.gradle.kts tv/build.gradle.kts
           sed -i '/UPDATE_APK_PREFIX/s/BitChord-/Bit-/' app/build.gradle.kts
           sed -i 's#repos/[A-Za-z0-9_-]*/[A-Za-z0-9_-]*/releases/latest#repos/${{ github.repository }}/releases/latest#' \
@@ -1877,7 +1983,8 @@ jobs:
           s = open("build.gradle.kts").read()
           m = re.search(r'(?:bitchordVersionName"\] = |baseVersion = )"([0-9.]+)"', s)
           ver = f"{m.group(1)}.{run}"
-          s = re.sub(r'extra\["bitchordVersionCode"\][^\n]*', f'extra["bitchordVersionCode"] = {39 + run}', s)
+          code = max(39 + run, int(os.environ.get("MIN_CODE", "0") or 0))
+          s = re.sub(r'extra\["bitchordVersionCode"\][^\n]*', f'extra["bitchordVersionCode"] = {code}', s)
           s = re.sub(r'extra\["bitchordVersionName"\] = [^\n]*(\n    if [^\n]*)?',
                      f'extra["bitchordVersionName"] = "{ver}"', s)
           open("build.gradle.kts", "w").write(s)
@@ -1994,16 +2101,16 @@ jobs:
             CODE="$(grep -oP "versionCode='\K[0-9]+" <<< "$BADGE" | head -n 1)"
             NAME="$(grep -oP "versionName='\K[^']+" <<< "$BADGE" | head -n 1)"
             WANT="$(grep -oP 'bitchordVersionCode"\] = \K[0-9]+' build.gradle.kts | head -n 1)"
-            echo "APK: gói=$PKG versionCode=$CODE versionName=$NAME | cần: com.bit.dev $WANT $VER"
-            if [ "$PKG" != "com.bit.dev" ]; then
-              echo "::error::APK có tên gói '$PKG' (cần com.bit.dev). Cài lên sẽ thành app MỚI chứ không đè app cũ. Dừng, không đăng."
+            echo "APK: gói=$PKG versionCode=$CODE versionName=$NAME | cần: $APP_PKG $WANT $VER"
+            if [ "$PKG" != "$APP_PKG" ]; then
+              echo "::error::APK có tên gói '$PKG' (cần $APP_PKG). Cài lên sẽ thành app MỚI chứ không đè app cũ. Dừng, không đăng."
               exit 1
             fi
             if [ "$CODE" != "$WANT" ] || [ "$NAME" != "$VER" ]; then
               echo "::error::Phiên bản trong APK ($NAME / $CODE) không khớp bản định đăng ($VER / $WANT). Dừng, không đăng."
               exit 1
             fi
-            echo "- APK đúng gói com.bit.dev, v${NAME} (versionCode ${CODE}): cài đè lên app đang dùng" >> "$GITHUB_STEP_SUMMARY"
+            echo "- APK đúng gói ${APP_PKG}, v${NAME} (versionCode ${CODE}): cài đè lên app đang dùng" >> "$GITHUB_STEP_SUMMARY"
           fi
 
           # 2) Chữ ký: so với APK của release hiện tại. Lệch thì Android báo xung đột chữ ký và KHÔNG cài đè được. Chỉ cảnh báo.
@@ -2012,7 +2119,8 @@ jobs:
           else
             PREVDIR="$RUNNER_TEMP/prev-apk"
             rm -rf "$PREVDIR"; mkdir -p "$PREVDIR"
-            if gh release download --repo "$GITHUB_REPOSITORY" --pattern 'Bit-*.apk' --dir "$PREVDIR" --clobber > /dev/null 2>&1; then
+            if [ -n "${REF_APK:-}" ] && [ -f "${REF_APK:-}" ]; then cp "$REF_APK" "$PREVDIR/installed.apk"; fi
+            if ls "$PREVDIR"/*.apk > /dev/null 2>&1 || gh release download --repo "$GITHUB_REPOSITORY" --pattern 'Bit-*.apk' --dir "$PREVDIR" --clobber > /dev/null 2>&1; then
               PREV="$(ls "$PREVDIR"/*.apk 2>/dev/null | head -n 1)"
               cert() { "$APKSIGNER" verify --print-certs "$1" 2>/dev/null | grep -m1 -i 'certificate SHA-256 digest' | awk '{print $NF}'; }
               A="$(cert "$APK")"
