@@ -7,6 +7,8 @@ name: Gemini dịch lời sang tiếng Việt - xưng hô chuẩn (APK, cập nh
 #   CÁCH SỬA: input installed_version (mặc định 1.9.1.31 = bản đang cài). Ngay đầu job, workflow tải APK của release v<installed_version>,
 #   đọc tên gói + versionCode của nó, rồi build đúng gói đó với versionCode cao hơn. Chạy nó không bao giờ đổi tên gói so với app trên máy.
 #   Không tìm thấy release đó thì DỪNG ngay (trước khi build lâu). Để trống installed_version = theo release mới nhất.
+#   v6.1: sửa lỗi bước "Decide the package name" chết im lặng (exit 2) trên runner ubuntu-26.04: runner chạy bash với -e nên ls không thấy
+#   aapt2 là cả bước thoát. Giờ tắt -e trong bước đó + ghim runs-on: ubuntu-24.04 (có sẵn Android SDK như các bản build trước).
 #   Muốn ép tay: input package_name = com.bit.dev / com.music.bitchord / com.dev.bitchord. Chữ ký cũng được so với APK của bản đang cài.
 
 # BẢN v4 của gemini-vi-lyrics-lite.yml: viết lại prompt xưng hô cho Gemini. Cùng cách chạy, cùng APK, cùng cách cài đè.
@@ -120,7 +122,7 @@ concurrency:
 
 jobs:
   gemini-vi:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
     env:
       BIT_DEV_BUILD: 'true'
@@ -143,13 +145,21 @@ jobs:
           INSTALLED_VERSION: ${{ inputs.installed_version }}
         run: |
           set -uo pipefail
+          set +e   # runner chạy bash với -e; tắt đi để lệnh ls/grep không tìm thấy gì không làm cả bước chết im lặng
           WANT_PKG="${WANT_PKG:-auto}"
           INST="${INSTALLED_VERSION:-}"; INST="${INST//[[:space:]]/}"; INST="${INST#v}"
           SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
           AAPT2="$(ls "$SDK"/build-tools/*/aapt2 2>/dev/null | sort -V | tail -n 1)"
           if [ -z "$AAPT2" ]; then
-            echo "::error::Không thấy aapt2 trên runner nên không đọc được tên gói của APK. Chọn tay package_name."
-            [ "$WANT_PKG" = "auto" ] && exit 1
+            AAPT2="$(find /usr/local/lib/android /opt /usr/lib/android-sdk -name aapt2 -type f 2>/dev/null | sort -V | tail -n 1)"
+          fi
+          echo "SDK=$SDK | aapt2=${AAPT2:-không thấy}"
+          if [ -z "$AAPT2" ]; then
+            if [ "$WANT_PKG" = "auto" ]; then
+              echo "::error::Không thấy aapt2 trên runner nên không đọc được tên gói của APK. Chọn tay package_name."
+              exit 1
+            fi
+            echo "::warning::Không thấy aapt2 trên runner, bỏ qua bước đọc APK cũ, dùng gói chọn tay."
           fi
           badge() { "$AAPT2" dump badging "$1" 2>/dev/null; }
           apk_pkg() { badge "$1" | grep -oP "package: name='\K[^']+" | head -n 1; }
@@ -2087,6 +2097,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -uo pipefail
+          set +e
           APK="$(ls app/build/outputs/apk/dev/release/*.apk | head -n 1)"
           SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
           AAPT2="$(ls "$SDK"/build-tools/*/aapt2 2>/dev/null | sort -V | tail -n 1)"
