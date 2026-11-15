@@ -9,6 +9,8 @@ name: Gemini dịch lời sang tiếng Việt - xưng hô chuẩn (APK, cập nh
 #   Không tìm thấy release đó thì DỪNG ngay (trước khi build lâu). Để trống installed_version = theo release mới nhất.
 #   v6.1: sửa lỗi bước "Decide the package name" chết im lặng (exit 2) trên runner ubuntu-26.04: runner chạy bash với -e nên ls không thấy
 #   aapt2 là cả bước thoát. Giờ tắt -e trong bước đó + ghim runs-on: ubuntu-24.04 (có sẵn Android SDK như các bản build trước).
+#   v6.2: repo chỉ còn 1 release (v1.9.1.33, gói com.music.bitchord, do ALL-IN-ONE đăng) nên "auto" không tìm được bản 1.9.1.31 để biết gói.
+#   Mặc định package_name giờ là com.bit.dev (gói của app "Bit Dev" đang cài), không cần tìm release nữa.
 #   Muốn ép tay: input package_name = com.bit.dev / com.music.bitchord / com.dev.bitchord. Chữ ký cũng được so với APK của bản đang cài.
 
 # BẢN v4 của gemini-vi-lyrics-lite.yml: viết lại prompt xưng hô cho Gemini. Cùng cách chạy, cùng APK, cùng cách cài đè.
@@ -100,14 +102,14 @@ on:
         type: string
         default: "1.9.1.31"
       package_name:
-        description: "Tên gói của APK. auto = theo installed_version (khuyên dùng, để app cập nhật ĐÈ chứ không đẻ thêm app). Ép tay thì chọn đúng gói của app đang cài: Bit Dev = com.bit.dev | BitChord = com.music.bitchord | BitChord Dev = com.dev.bitchord"
+        description: "Tên gói của APK. Mặc định com.bit.dev = app tên Bit Dev (bản build từ workflow này). auto = đọc từ APK của release installed_version (chỉ dùng được khi release đó còn trong repo). Ép tay thì chọn đúng gói của app đang cài: Bit Dev = com.bit.dev | BitChord = com.music.bitchord | BitChord Dev = com.dev.bitchord"
         type: choice
         options:
-          - auto
           - com.bit.dev
+          - auto
           - com.music.bitchord
           - com.dev.bitchord
-        default: auto
+        default: com.bit.dev
       publish_release:
         description: "Đăng APK lên mục Releases (cần để app cập nhật trong app được). Tắt = chỉ có file ở Artifacts"
         type: boolean
