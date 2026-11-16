@@ -1,4 +1,8 @@
 name: "Bit-dev ALL-IN-ONE: Automix + Canvas + Màn hình khóa Liquid Glass v2 + AI DJ + engine native → build, ký, release, tự cập nhật"
+# BẢN SỬA: input bit_dev_app (mặc định BẬT) build đúng app Bit Dev đang cài (gói com.bit.dev, khoá ký của Bit Dev APK) để cập nhật ĐÈ,
+# không còn đẻ thêm app com.music.bitchord. Có thêm chốt chặn: cùng gói mà khác chữ ký / versionCode thấp hơn bản đang phát thì dừng trước khi đăng.
+# Runner ghim ubuntu-24.04 (ubuntu-latest giờ là 26.04, thiếu Android SDK ở đường dẫn cũ).
+# Ảnh bìa màn khoá v2: chiếm 82% bề rộng, 4 mép tan mờ vào bản sao mờ của chính ảnh.
 
 # ======================================================================================
 # MỘT FILE duy nhất. Chạy tay: Actions -> chọn workflow này -> Run workflow.
@@ -67,6 +71,10 @@ on:
           - dev
           - benchmark
         default: prod
+      bit_dev_app:
+        description: "Build đúng app Bit Dev đang cài (gói com.bit.dev, cùng khoá ký với workflow Bit Dev APK) để bản mới CÀI ĐÈ lên nó, không đẻ thêm app. Bật thì bỏ qua app_variant. Tắt = build theo app_variant như cũ (prod = com.music.bitchord)"
+        type: boolean
+        default: true
       lockscreen_v2:
         description: "Màn hình khóa v2: ổn định hơn, Liquid Glass thiết kế lại, đồng hồ mới (có Leon). Tắt nếu build lỗi để về bản cũ"
         type: boolean
@@ -124,7 +132,7 @@ concurrency:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
@@ -6780,6 +6788,7 @@ jobs:
         shell: bash
         env:
           VARIANT: ${{ inputs.app_variant }}
+          BIT_DEV: ${{ inputs.bit_dev_app }}
           RELEASE_KS_B64: ${{ secrets.KEYSTORE_BASE64 }}
           RELEASE_KS_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
           RELEASE_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
@@ -6789,6 +6798,14 @@ jobs:
           set -euo pipefail
           mkdir -p "$HOME/.android"
           echo "ANDROID_USER_HOME=$HOME/.android" >> "$GITHUB_ENV"
+          if [ "${BIT_DEV:-false}" = "true" ] && [ -z "${RELEASE_KS_B64:-}" ]; then
+            # Repo chưa có secret KEYSTORE_*: workflow Bit Dev APK ký bằng khoá dev có sẵn trong file của nó. Dùng lại đúng khoá đó,
+            # nếu không Android coi chữ ký khác và không cài đè được lên app Bit Dev đang cài.
+            RELEASE_KS_B64='MIIKNAIBAzCCCd4GCSqGSIb3DQEHAaCCCc8EggnLMIIJxzCCBa4GCSqGSIb3DQEHAaCCBZ8EggWbMIIFlzCCBZMGCyqGSIb3DQEMCgECoIIFQDCCBTwwZgYJKoZIhvcNAQUNMFkwOAYJKoZIhvcNAQUMMCsEFK0fxII8tlxuTGjlPy9OEoOb4zh1AgInEAIBIDAMBggqhkiG9w0CCQUAMB0GCWCGSAFlAwQBKgQQhoPbS2/EH0Iq39/VLBv1jwSCBNAs4rqRA9jwqLChGhVDGNkL8Z49X1qbtTFdYUjeNjsUWKw+0mtXbsRP9lW04ub3pGi0EJYqvppU1/oywxqpsDluz+QQzIBMvhUS3uWEr5CtNGR5Mr+xVRhnU8FkZ+nXGs8+4ifof2PK9B+14LI3V0Z8HUiWz/+iMkvT596xjj9mjtxtSv92s0vTNpZluQMKKqx5Q4Au37uNNHW3Igae9vEU0Ytfh43zD4sVAFuGsg6u4ULtb8zjXhu5UuIV+UljDKnKWZcVmiwGAQ887QMlJGOJDZi7pSP5MOpaT4pYzMCAa23XISYXq2/n7tZMMNKLfXKQOjm9PVTzwQ7ijPgoiLmYGXRz2Vyzvm+rVCvTvLQVTnprxCxVvy4fNGz4lapcrcYIwTiPaGiG+HeVuWNXprZDP9DwRE+quQYIl6V/7bJAQopebKjXttqh3yIUe9U8L5McJ7jZ3D2DxTRntMIOP8heC8ZqT7dZyuP+2Sl9BY74BSQEz5k+h/tfv3a7Mbjcb53isQrgEsrwP7hlf5yNP1RiX+Tug7wbzCD0oqLU+oThGz9ilAjOL1CowWiyYOUur4ZFt+MQn9Ib7E1727fsmM3q1G4k0k5Iie5UNWcINNB1e9b9OIAJzevgVusUdsgYkO06VTN3mGqZOq9d7Qq9HTz/BCnjgJFRu3fmyzHQyiCMN8qH+6C99ePek39L7GJKqYnXZhxWNhO4C7xFEJvy/OyKOzcJFd9e3ZYkg1ChlPoCXkS3G0PeCFZ+s6yr6RxztS0S5QCXjpyYWeJAwE43lmZ8tNaOpfNxqzYrXmtiC5NCPh/wp+GBh80PsfLbO0b4KizbW5QZQJQoKZTu6hBjamF/9GqjTsMuj4gNF1X4cw9WV6K89z+dGoYx8h6whGZMbGJ57txuAo+eG+DiNgBzo6pwoZNNABwc5veksEbuTnAxuG3wuv+91Bb6lHxar+be493NsO6bxBHoFV1yGI44PPvDgGSEUyv36br1axP/ZKlVal6hgsbSHDyzhaoK3NvRdGHB5/GZonXT8zG3PB2vtDb2I/fPd13w/uW22qEoxV/mNC6I1GePYCp85o/47ETv5feQHaEUONAjLvrohooBGLZk0Ovxw4UyQIQuei+i+HjNqugi5BXzUGCd0DnQ/9sUg2ds+ZrsRtoNAQF2ogik/mpaSdft/3Zd1utl2wt6ThchJ4b1ayrmx8H/QNJ7yYG9jvioY0YF9KuN+69wP1Ailq7hrGzglncaN4BbwAgoX2mrfqclY94jcjn6NWtD33Y0XHlWA5WJtkQF4j1hAlVtWKNjm2/ZUjrGIW3luWtBiycO2xxiwj6nEhVCjgbQ3U9rmp8/XYp+hnJOm/4qAMiHKKRToDr2toaRFz5UjyYg0UIp0cNXnD1mP2S2kRAhFBQZXQPRSWdKPURX8C4EfRb/K1m8OiNxO9brvSKzJV6il9+BOoeqCrUHTvRvxcj28ROSKAnv+spaon+t3diyg48zrOmvayC7VJ3Ypn5G7y0Dxi5L8fjuYA/yl4ql3WaEJyoG7GQtu/liq1vrPlR8YCsxhzvtbksoSWogT8LrNI/LW5IsNQwlBgm1Hx8/+Kfn+FpVRCLiPIg3EyocX+QljpbWY9rKQVImf90heiG9ac+feerUqTFAMBsGCSqGSIb3DQEJFDEOHgwAYgBpAHQAZABlAHYwIQYJKoZIhvcNAQkVMRQEElRpbWUgMTc5NDA0OTUzOTY4MTCCBBEGCSqGSIb3DQEHBqCCBAIwggP+AgEAMIID9wYJKoZIhvcNAQcBMGYGCSqGSIb3DQEFDTBZMDgGCSqGSIb3DQEFDDArBBRmjjcNhxpHIeR4BNN+17LtuxnKVgICJxACASAwDAYIKoZIhvcNAgkFADAdBglghkgBZQMEASoEEGbLAv6ZH20ohfUWYPBGBuSAggOAxkBCVVa9dFi6GL/io3Jc4snGmi65ca5wivyubHYCcmQfKKcFW0mV1G/W/WvS9rHqfqSscHe5W5Yzdu+pH2X4A1sGpEi5KVKJLg7BTCTCKu4rbMg5xBHMVu2akp81Y9PrBZ7VYPfahrkQ2dW+JNo6mqCu2RN6H1M5cjODPQL37e/+xlbs9dDPx81t3ImnLc0NhH4qCu882ws/dgUnWVgmtFE/V0iThHebjgNsP5/g/81tm/Vn+Ddu1OOk/xLC37G4s/SrM8b98bIsq3N5IMIHrgppgFLdO2S/1+kFuN6mY3ksS3s9CEbDNiOR/YkzKIMqC7EF1jN+cIE3N8yjUxvY8AN3WBn4j/FSMhE2hv/QoM1v5v5Q6W6IWt0wEw6MqpWuAYHqPbxHRycl109mDeoZbamE6kAKXk6hZJHmS78CFA0gnQjxR1gnGLr6iJ2opxcUbtsEgURGENH6wfuFHZPMEnTBC6dRiimBEsV+Cnfcj0ep+PG7fWlbUz3XXjEtPsna3BsLvPLRwLVGWdJjTOINyHIT40ut0IS+iBa6hzFesQrDUvRoF+N4wvf9aiWfxoetLhLUI/+sBQb0UAtYpaqUN8tJrMn5gPTjCB/ve1kEK6LNHhbemi25OdC9wnP6ak/R+ZofPPBqVrRUMX1XN1Verqg130AZGKAs2cM+hkmmzqzy7gZmh2Hrq4v6S8O5eB+eXHFqjPJ+OKj7zzPYm4Ao+9pnokFnfdvDzWlGl2mV8WHoeafZ7EaYeYW/KGuQGO5N3BFTOYBPlCbSnyF4iQyzv3Kjl9IdHCh/h3kuNs/LiV2pCaBKq8yjONt8K2QrtMW021Uz8C7MpXsprfrKhbPzVP61w3h2/LtaYonU+YWFidDs6NcbHSt0/V5aNDc+e2vcUUx2g1zEW/lsmaNXkyaVaEk1gJ8Mv0nveu+2O9n3r/hvEIMsB6c8RN2zMO+HLJQCx5vT15rLfoji5xyAJ7zJToiVlNGXEPXkFMwYgcPt2MCfGQqHuJSJEwfqTnqnpUvILxoR6SUhURFHEjxC4bfMN5RmrHbIcdLrrtmphhOGnBf0i2wHlSHxvjDdjDWIhjXQksim2Io3bobPfhKa8IWNWUmOnMxWOmgN8PQdVbhTjtF5Rnv7xUu7Bk2NVY+Qucp/2D+uolHxaVnYqkrGxcxd3c550rnhSPtGzhV5Rz+j3LUwTTAxMA0GCWCGSAFlAwQCAQUABCDfwbM/nRPBq7oa0FAlyGkh+317OWYy68aWhoYYmotwdgQUeCNvgbp4HpFAtXAIWXdR1NJdQ/kCAicQ'
+            RELEASE_KS_PASS='M8rnSCC3C4TkChAh'
+            RELEASE_KEY_ALIAS='bitdev'
+            RELEASE_KEY_PASS='M8rnSCC3C4TkChAh'
+          fi
           if [ "$VARIANT" != "benchmark" ] && [ -n "${RELEASE_KS_B64:-}" ]; then
             # Như android.yml: Gradle tự ký bằng signingConfigs.release.
             printf '%s' "$RELEASE_KS_B64" | base64 -d > bitchord-release.jks
@@ -6869,12 +6886,22 @@ jobs:
           echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
 
       # Lệnh build ở root giống android.yml: bản release nhúng luôn APK đồng hồ nên cần build cả module wearos.
+      - name: Đổi gói thành com.bit.dev (cập nhật đè lên app Bit Dev đang cài)
+        if: ${{ inputs.build_apk && inputs.bit_dev_app }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          sed -i 's/com\.dev\.bitchord/com.bit.dev/g; s/BitChord Dev/Bit Dev/g' \
+            app/build.gradle.kts app/src/dev/AndroidManifest.xml wearos/build.gradle.kts tv/build.gradle.kts
+          grep -n 'com.bit.dev' app/build.gradle.kts | head -5
+
       - name: Build APK (theo app_variant)
         id: build
         if: ${{ inputs.build_apk }}
         shell: bash
         env:
           VARIANT: ${{ inputs.app_variant }}
+          BIT_DEV: ${{ inputs.bit_dev_app }}
         run: |
           set -o pipefail
           case "$VARIANT" in
@@ -6883,6 +6910,9 @@ jobs:
             benchmark) TASK=assembleDevBenchmark; DIR=app/build/outputs/apk/dev/benchmark; PKG=com.dev.bitchord.benchmark2 ;;
             *) echo "::error::app_variant không hợp lệ: $VARIANT"; exit 1 ;;
           esac
+          if [ "${BIT_DEV:-false}" = "true" ]; then
+            VARIANT=dev; TASK=assembleDevRelease; DIR=app/build/outputs/apk/dev/release; PKG=com.bit.dev
+          fi
           echo "Build $VARIANT: ./gradlew $TASK (gói $PKG)"
           echo "pkg=$PKG" >> "$GITHUB_OUTPUT"
           echo "dir=$DIR" >> "$GITHUB_OUTPUT"
@@ -6903,7 +6933,8 @@ jobs:
           MODE: ${{ steps.sign.outputs.mode }}
         run: |
           set -euo pipefail
-          SRC=$(ls "$DIR"/*arm64-v8a*.apk | head -1)
+          SRC=$(ls "$DIR"/*arm64-v8a*.apk 2>/dev/null | head -1 || true)
+          if [ -z "$SRC" ]; then SRC=$(ls "$DIR"/*.apk | head -1); fi
           echo "APK từ Gradle: $SRC"
           mkdir -p dist
           NAME="Bit-v${VERSION}_arm64-v8a.apk"
@@ -6935,6 +6966,47 @@ jobs:
           path: dist/*.apk
           retention-days: 7
           if-no-files-found: error
+
+      # Chốt chặn: không đăng APK mà Android sẽ không cài đè được lên bản đang phát.
+      - name: Chốt chặn cài đè (cùng gói thì phải cùng chữ ký và versionCode cao hơn)
+        if: ${{ inputs.build_apk && inputs.publish_release }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PKG: ${{ steps.build.outputs.pkg }}
+          CODE: ${{ steps.ver.outputs.code }}
+          CERT: ${{ steps.apk.outputs.cert }}
+        run: |
+          set -uo pipefail
+          set +e
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* 2>/dev/null | sort -V | tail -1)
+          D="$RUNNER_TEMP/prev-release"; rm -rf "$D"; mkdir -p "$D"
+          gh release download --repo "$GITHUB_REPOSITORY" --pattern 'Bit-*.apk' --dir "$D" --clobber > /dev/null 2>&1
+          PREV="$(ls "$D"/*.apk 2>/dev/null | head -n 1)"
+          if [ -z "$PREV" ] || [ -z "$BT" ]; then
+            echo "Không có APK của bản đang phát để so (hoặc không có build-tools), bỏ qua chốt chặn."
+            exit 0
+          fi
+          B="$("$BT/aapt2" dump badging "$PREV" 2>/dev/null)"
+          PPKG="$(grep -oP "package: name='\K[^']+" <<< "$B" | head -n 1)"
+          PCODE="$(grep -oP "versionCode='\K[0-9]+" <<< "$B" | head -n 1)"
+          PCERT="$("$BT/apksigner" verify --print-certs "$PREV" 2>/dev/null | grep -i -m1 "certificate SHA-256" | sed 's/.*: *//')"
+          echo "Bản đang phát: gói ${PPKG:-?} versionCode ${PCODE:-?} | bản này: gói $PKG versionCode $CODE"
+          if [ "$PPKG" != "$PKG" ]; then
+            echo "::notice::Bản đang phát là gói ${PPKG:-?}, bản này là $PKG. App cài gói ${PPKG:-?} sẽ không nhận bản này, app gói $PKG thì nhận được. Không chặn."
+            exit 0
+          fi
+          BAD=0
+          if [ -n "$PCERT" ] && [ -n "$CERT" ] && [ "$PCERT" != "$CERT" ]; then
+            echo "::error::Cùng gói $PKG nhưng KHÁC chữ ký với bản đang phát: Android sẽ từ chối cài đè. Dừng trước khi đăng."
+            BAD=1
+          fi
+          if [ -n "${PCODE:-}" ] && (( CODE <= PCODE )); then
+            echo "::error::versionCode $CODE không cao hơn bản đang phát ($PCODE): Android chặn hạ phiên bản. Dừng trước khi đăng."
+            BAD=1
+          fi
+          if [ "$BAD" = 1 ]; then exit 1; fi
+          echo "Cùng gói, cùng chữ ký, versionCode cao hơn: cài đè được."
 
       # ---- Release -----------------------------------------------------------------------
       # Tạo release mới TRƯỚC, kiểm tra app sẽ thấy nó, rồi mới xóa cái cũ: không có lúc nào repo
