@@ -2927,7 +2927,7 @@ jobs:
                                   contentDescription = null,
                                   contentScale = ContentScale.Crop,
                                   modifier = Modifier
-                                      .fillMaxWidth()
+                                      .fillMaxWidth(CoverWidthFrac)
                                       .aspectRatio(aspect)
                                       .edgeMasked(
                                           top = top,
@@ -2935,7 +2935,8 @@ jobs:
                                           topFrac = CoverFeatherTop,
                                           bottomFrac = CoverFeatherBottom,
                                           invert = true,
-                                      ),
+                                      )
+                                      .sideFeather(CoverFeatherSide),
                               )
                           }
                       }
@@ -2950,6 +2951,39 @@ jobs:
           /** How far in from the top / bottom of a squarer cover's OWN height it dissolves. */
           private const val CoverFeatherTop = 0.30f
           private const val CoverFeatherBottom = 0.34f
+
+          /**
+           * A squarer cover is no longer laid edge to edge: it takes this share of the screen width, and the rest
+           * is the soft, blurred copy of itself, so the picture sits in the screen like a photo with a feathered
+           * edge instead of filling it.
+           */
+          private const val CoverWidthFrac = 0.82f
+
+          /** How far in from the left / right of that cover its edge dissolves into the blurred copy. */
+          private const val CoverFeatherSide = 0.24f
+
+          /** The left / right counterpart of [edgeBrush]: 0 at both side edges, easing up to 1 inside. */
+          private fun sideBrush(frac: Float): Brush {
+              val steps = 10
+              val stops = ArrayList<Pair<Float, Color>>()
+              for (i in 0..steps) {
+                  val t = i / steps.toFloat()
+                  stops += (t * frac) to Color.Black.copy(alpha = smoothstep(t))
+              }
+              for (i in 0..steps) {
+                  val t = i / steps.toFloat()
+                  stops += (1f - frac + t * frac) to Color.Black.copy(alpha = 1f - smoothstep(t))
+              }
+              return Brush.horizontalGradient(*stops.toTypedArray())
+          }
+
+          /** Multiplies what is drawn by [sideBrush], in a layer of its own, so the left and right edges dissolve. */
+          private fun Modifier.sideFeather(frac: Float): Modifier = this
+              .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen }
+              .drawWithContent {
+                  drawContent()
+                  drawRect(sideBrush(frac), blendMode = BlendMode.DstIn)
+              }
 
           /**
            * The edge weight along the height: 1 at the very top and bottom (scaled by [top] and [bottom]),
