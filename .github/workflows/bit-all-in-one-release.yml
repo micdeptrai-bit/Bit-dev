@@ -2,7 +2,7 @@ name: "Bit-dev ALL-IN-ONE: Automix + Canvas + Màn hình khóa Liquid Glass v2 +
 # BẢN SỬA: input bit_dev_app (mặc định BẬT) build đúng app Bit Dev đang cài (gói com.bit.dev, khoá ký của Bit Dev APK) để cập nhật ĐÈ,
 # không còn đẻ thêm app com.music.bitchord. Có thêm chốt chặn: cùng gói mà khác chữ ký / versionCode thấp hơn bản đang phát thì dừng trước khi đăng.
 # Runner ghim ubuntu-24.04 (ubuntu-latest giờ là 26.04, thiếu Android SDK ở đường dẫn cũ).
-# Ảnh bìa màn khoá v2: nằm giữa clock và player, chiếm hết bề rộng, mép trái/phải mờ 14%, trên/dưới mờ 16%/14%. Thẻ player nhỏ gọn hơn vào bản sao mờ của chính ảnh.
+# Ảnh bìa màn khoá v2: nằm giữa clock và player, chiếm hết bề rộng, mép trái/phải để nguyên (không mờ), mép trên/dưới luôn mờ 20% chiều cao ảnh kể cả khi ẩn đồng hồ và player. Thẻ player nhỏ gọn hơn vào bản sao mờ của chính ảnh.
 
 # ======================================================================================
 # MỘT FILE duy nhất. Chạy tay: Actions -> chọn workflow này -> Run workflow.
@@ -2938,13 +2938,12 @@ jobs:
                                       .fillMaxWidth(CoverWidthFrac)
                                       .aspectRatio(aspect)
                                       .edgeMasked(
-                                          top = top,
-                                          bottom = bottom,
+                                          top = { 1f },
+                                          bottom = { 1f },
                                           topFrac = CoverFeatherTop,
                                           bottomFrac = CoverFeatherBottom,
                                           invert = true,
-                                      )
-                                      .sideFeather(CoverFeatherSide),
+                                      ),
                               )
                           }
                       }
@@ -2956,9 +2955,9 @@ jobs:
           private const val EdgeBlurTop = 0.20f
           private const val EdgeBlurBottom = 0.28f
 
-          /** How far in from the top / bottom of a squarer cover's OWN height it dissolves. */
-          private const val CoverFeatherTop = 0.16f
-          private const val CoverFeatherBottom = 0.14f
+          /** How far in from the top / bottom of a squarer cover's OWN height it dissolves, whether or not the clock / player are up. */
+          private const val CoverFeatherTop = 0.20f
+          private const val CoverFeatherBottom = 0.20f
 
           /**
            * A squarer cover is no longer laid edge to edge: it takes this share of the screen width, and the rest
@@ -2967,38 +2966,12 @@ jobs:
            */
           private const val CoverWidthFrac = 1.0f
 
-          /** How far in from the left / right of that cover its edge dissolves into the blurred copy. */
-          private const val CoverFeatherSide = 0.14f
-
           /**
            * Where the cover sits up and down, as a bias of the free height: 0 is the middle of the screen, -1 the top.
            * -0.15 puts a square cover's top about a fifth of the way down, so it fills the space between the clock and
            * the (now smaller) player instead of sitting in the exact middle of the screen.
            */
           private const val CoverVerticalBias = -0.15f
-
-          /** The left / right counterpart of [edgeBrush]: 0 at both side edges, easing up to 1 inside. */
-          private fun sideBrush(frac: Float): Brush {
-              val steps = 10
-              val stops = ArrayList<Pair<Float, Color>>()
-              for (i in 0..steps) {
-                  val t = i / steps.toFloat()
-                  stops += (t * frac) to Color.Black.copy(alpha = smoothstep(t))
-              }
-              for (i in 0..steps) {
-                  val t = i / steps.toFloat()
-                  stops += (1f - frac + t * frac) to Color.Black.copy(alpha = 1f - smoothstep(t))
-              }
-              return Brush.horizontalGradient(*stops.toTypedArray())
-          }
-
-          /** Multiplies what is drawn by [sideBrush], in a layer of its own, so the left and right edges dissolve. */
-          private fun Modifier.sideFeather(frac: Float): Modifier = this
-              .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen }
-              .drawWithContent {
-                  drawContent()
-                  drawRect(sideBrush(frac), blendMode = BlendMode.DstIn)
-              }
 
           /**
            * The edge weight along the height: 1 at the very top and bottom (scaled by [top] and [bottom]),
