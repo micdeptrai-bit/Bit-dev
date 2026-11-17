@@ -3610,8 +3610,14 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A -- app shared sharedUi native docs
-          git commit -m "Automix: manual mix window, no tempo change, stem separation and handover (as enabled)"
+          # Chỉ add những thư mục có thật: thiếu một thư mục là git add báo "pathspec did not match" và chết cả bước.
+          DIRS=()
+          for D in app shared sharedUi native docs; do
+            if [ -e "$D" ]; then DIRS+=("$D"); fi
+          done
+          git add -A -- "${DIRS[@]}"
+          # Không có gì để commit (hoặc commit lỗi) thì bỏ qua: cây làm việc đã có patch, build vẫn chạy bình thường.
+          git commit -m "Automix: manual mix window, no tempo change, stem separation and handover (as enabled)" || echo "Không commit được, bỏ qua (không ảnh hưởng build)."
 
       - name: Native self-test (stem separation core)
         if: ${{ inputs.stem_separation }}

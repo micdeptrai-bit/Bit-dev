@@ -1,0 +1,2204 @@
+name: Gemini dịch lời sang tiếng Việt - xưng hô chuẩn (APK, cập nhật đè)
+
+# BẢN v5 (sửa lỗi "bấm cập nhật trong app lại đẻ thêm một app"):
+#   NGUYÊN NHÂN: workflow này luôn ép tên gói thành com.bit.dev, còn "Bit-dev ALL-IN-ONE" mặc định build com.music.bitchord (bản prod).
+#   Cả hai đều đăng lên CÙNG kênh Releases (--latest) với cùng tiền tố file "Bit-", và hộp thoại cập nhật trong app KHÔNG kiểm tra tên gói,
+#   chỉ tải APK của release mới nhất. Release mới nhất khác tên gói với app đang cài thì Android coi là app KHÁC và cài thành app mới.
+#   CÁCH SỬA: input installed_version (mặc định 1.9.1.31 = bản đang cài). Ngay đầu job, workflow tải APK của release v<installed_version>,
+#   đọc tên gói + versionCode của nó, rồi build đúng gói đó với versionCode cao hơn. Chạy nó không bao giờ đổi tên gói so với app trên máy.
+#   Không tìm thấy release đó thì DỪNG ngay (trước khi build lâu). Để trống installed_version = theo release mới nhất.
+#   v6.1: sửa lỗi bước "Decide the package name" chết im lặng (exit 2) trên runner ubuntu-26.04: runner chạy bash với -e nên ls không thấy
+#   aapt2 là cả bước thoát. Giờ tắt -e trong bước đó + ghim runs-on: ubuntu-24.04 (có sẵn Android SDK như các bản build trước).
+#   v6.2: repo chỉ còn 1 release (v1.9.1.33, gói com.music.bitchord, do ALL-IN-ONE đăng) nên "auto" không tìm được bản 1.9.1.31 để biết gói.
+#   Mặc định package_name giờ là com.bit.dev (gói của app "Bit Dev" đang cài), không cần tìm release nữa.
+#   v6.3: build hỏng ở :app:mergeDevReleaseResources (Duplicate resources lock_screen_player). Base đã tự có màn khoá (lockscreen.patch trong
+#   automix-all-in-one) nên bước "màn khoá iOS 26" của file này thêm bản thứ hai, trùng chuỗi và đè LockScreenLauncher. Giờ bước đó tự bỏ qua khi base đã có.
+#   v6.4: HAI file gemini-vi-lyrics-lite (có dấu cách và không dấu cách) giờ giống hệt nhau. Bản không dấu cách còn ở v5, chưa có phần bỏ qua
+#   màn khoá nên vẫn lỗi Duplicate resources lock_screen_player và làm mất LockScreenLauncher.install / requestOverlayPermission.
+#   Bước dựng lại nền giờ đặt rõ các công tắc no_speedup / stem_separation / stem_mix của automix-manual-mix = false (trước đây truyền nguyên
+#   biểu thức GitHub chưa xử lý, chạy được nhưng chỉ nhờ may). Bản Gemini vẫn chỉ gồm manual-mix + Gemini, không kéo native tách giọng vào.
+#   Muốn ép tay: input package_name = com.bit.dev / com.music.bitchord / com.dev.bitchord. Chữ ký cũng được so với APK của bản đang cài.
+
+# BẢN v4 của gemini-vi-lyrics-lite.yml: viết lại prompt xưng hô cho Gemini. Cùng cách chạy, cùng APK, cùng cách cài đè.
+#
+# MỚI TRONG BẢN NÀY: MÀN KHOÁ KIỂU iOS 26 (bước "Add the iOS 26 lock screen", chạy sau bước prompt Gemini, trước bước đánh số bản dựng).
+#   - Thêm LockScreenActivity (Compose) hiện đè lên màn khoá hệ thống khi bật màn hình lúc máy đang khoá và Bit Dev đang phát nhạc.
+#   - Giao diện theo 3 ảnh mẫu: nền Canvas / ảnh bìa toàn màn hình, giờ + ngày một dòng, thẻ kính mờ điều khiển, đèn pin + camera, vuốt lên để mở khoá.
+#   - Mở bằng startActivity trực tiếp, không được thì bằng thông báo full-screen-intent (Android 10+ chặn mở Activity từ nền).
+#   - Có công tắc trong Cài đặt (mặc định BẬT) và nút mở trang cấp quyền. Máy Xiaomi / HyperOS, OPPO, vivo cần thêm quyền
+#     "Hiển thị trên màn hình khoá" + "Hiển thị cửa sổ bật lên khi chạy nền" trong Thông tin ứng dụng.
+#   - Vẫn cùng gói com.bit.dev, cùng khoá ký, versionCode cao hơn: app cũ nhận bản mới qua Releases và cài đè như trước.
+#
+# THAY ĐỔI SO VỚI BẢN LITE v3:
+#   - Prompt dịch tiếng Việt viết lại bằng TIẾNG ANH (đầu ra vẫn là tiếng Việt), chia 3 khối:
+#       1. PRONOUN PLAN: bắt Gemini xác định TRƯỚC khi dịch: ai hát (giới tính, vai), hát cho ai, quan hệ + sắc thái. Có thứ tự bằng chứng:
+#          SONG NOTES > dấu hiệu rõ trong lời (my man, boyfriend, queen, sir, he/she chỉ người yêu...) > thể loại/ngữ cảnh >
+#          gợi ý yếu (baby, honey, bro, tên nghệ sĩ: không bao giờ tự quyết). Cấm mặc định "anh - em" hay giả định người hát là nam.
+#          Có bảng chọn cặp theo quan hệ: tình nhân, chia tay, bạn bè, diss/rap, đám đông, cha mẹ - con, cầu nguyện, tự thoại, cổ trang,
+#          và cặp trung tính (tôi - người, tớ - cậu, mình - bạn) khi không đủ dấu hiệu.
+#       2. PRONOUN FORMS: đại từ sở hữu (tim anh, mắt em), xưng gọi baby/babe theo cặp, ngôi thứ ba đúng giới + đúng sắc thái
+#          (anh ấy/hắn, cô ấy/ả), chúng ta/chúng mình/tụi mình/chúng tôi, không trộn sắc thái (tao - em, tôi - mày).
+#       3. STYLE + OUTPUT: "analysis" (tối đa 40 từ, có mẫu: Singer/Listener/Cues/Register/Exceptions) + "pair" (hỗ trợ cặp thứ hai cho song ca).
+#   - Lượt rà xưng hô (review_pass) dùng chung khối PRONOUN FORMS, kiểm cả sở hữu, xưng gọi, ngôi thứ ba, chúng ta. Chỉ sửa từ sai.
+#   - Prompt tra cứu (use_search) hỏi thêm: giới tính nghệ sĩ, song ca/khách mời, người được gọi là ai.
+#   - temperature giữ 0.3 (bản lite nâng lên 0.4): thấp hơn thì đại từ ổn định hơn giữa các dòng/đoạn.
+#   - CACHE_VERSION 3 -> 5: bản dịch xưng hô sai làm bằng prompt cũ (kể cả bản lite, cache 4) không còn được dùng lại.
+#   - Cách tính số bản dựng đổi sang đúng cách của "Bit Dev APK": đọc MỌI tag (có phân trang), lỗi API thì dừng thay vì đoán số.
+#   - MỚI: bước kiểm tra APK trước khi đăng: sai tên gói (không phải com.bit.dev), sai versionName/versionCode là DỪNG (khỏi đẻ thêm app
+#     hay bị Android coi là hạ phiên bản). Và so chữ ký với APK của release hiện tại: lệch thì cảnh báo.
+#
+# CẬP NHẬT ĐÈ, KHÔNG ĐẺ THÊM APP: package com.bit.dev, tên "Bit Dev", cùng khoá ký với workflow "Bit Dev APK", versionCode
+# (39 + số bản dựng) luôn lớn hơn mọi tag hiện có, file tên Bit-v<số>_arm64-v8a.apk đăng lên Releases (--latest) của chính repo này.
+# App cũ hỏi releases/latest, thấy bản mới, tải và cài đè ngay trong app (giữ nguyên dữ liệu).
+#
+# Chạy tay: tab Actions -> chọn workflow này -> Run workflow.
+# Một file duy nhất, KHÔNG commit gì vào repo. APK đăng lên Releases (tạo một tag mới, không đổi mã nguồn).
+#
+# LÀM GÌ:
+#   0. Dựng lại nền: chạy các bước của "automix-manual-mix (2).yml" (nó tự dựng all-in-one rồi áp patch có sẵn
+#      tính năng "Dịch lời bằng Gemini"). Bỏ qua nếu LyricsTranslation.kt trong repo đã có Gemini.
+#   1. Vá LyricsTranslation.kt (bản v4), khi dịch sang TIẾNG VIỆT:
+#      - Prompt dịch giả/lyricist với PRONOUN PLAN: Gemini chốt người hát, người nghe và MỘT cặp xưng hô (trường
+#        "analysis" + "pair") TRƯỚC khi viết lời. Bài dài chia nhiều đoạn: cặp xưng hô đoạn trước được truyền sang đoạn sau.
+#      - Lượt rà xưng hô (input review_pass, mặc định TẮT): một lời gọi riêng chỉ sửa đại từ lệch khỏi cặp đã chốt. Lỗi/hết giờ/lệch số
+#        dòng thì giữ bản dịch đầu.
+#      - Tra cứu bài hát bằng Google Search (input use_search, mặc định TẮT cho nhanh): nhận diện bài, câu chuyện, ai
+#        hát cho ai, nghĩa tiếng lóng. Một lần cho cả bài. Lỗi/hết giờ thì dịch như cũ.
+#      - Thời gian chờ tối đa: dịch 150 giây (nâng cả readTimeout, vì Http.client mặc định chỉ 30 giây), rà 60 giây,
+#        tra cứu 75 giây. Các ngôn ngữ đích khác vẫn dùng prompt tiếng Anh cũ.
+#      - Dòng Gemini trả về rỗng: giữ dòng gốc thay vì bỏ cả bài rồi rơi về Google Dịch.
+#      - safetySettings: HARASSMENT, HATE_SPEECH, SEXUALLY_EXPLICIT, DANGEROUS_CONTENT đều BLOCK_NONE.
+#   2. Đổi tên gói/phiên bản/updater y như "Bit Dev APK", build assembleDevRelease, kiểm tra APK, đăng lên Releases.
+#
+# Input thinking_budget: giới hạn "token suy nghĩ" của Gemini. Để trống = không đụng tới.
+#   Gemini Flash: nhập 0 để tắt hẳn. Gemini Pro không cho tắt (nhập 0 sẽ lỗi, rồi app rơi về Google Dịch).
+# Nếu vẫn thấy xưng hô lệch: bật review_pass (và use_search nếu bài ít người biết). SAU KHI CÀI APK: Cài đặt, "Dịch lời bằng Gemini", dán mã API.
+#
+# CẦN CÓ trong .github/workflows: "automix-manual-mix (2).yml" và "automix-all-in-one (2).yml" (đúng tên, hoặc đổi ở input).
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_file:
+        description: "Workflow chứa phần Gemini cần dựng lại (trong .github/workflows)"
+        type: string
+        default: "automix-manual-mix (2).yml"
+      chain_file:
+        description: "Workflow all-in-one mà base_file cần (trong .github/workflows)"
+        type: string
+        default: "automix-all-in-one (2).yml"
+      skip_base:
+        description: "Bỏ qua bước dựng lại nền (chỉ bật khi repo đã chứa sẵn phần Gemini)"
+        type: boolean
+        default: false
+      use_search:
+        description: "Tra cứu bài hát bằng Google Search trước khi dịch (chính xác hơn nhưng chậm hơn, tốn quota). Tắt = nhanh hơn"
+        type: boolean
+        default: false
+      review_pass:
+        description: "Bật lượt rà xưng hô riêng sau khi dịch (chính xác hơn nhưng tốn thêm một lời gọi). Tắt = tiết kiệm token"
+        type: boolean
+        default: false
+      thinking_budget:
+        description: "Giới hạn token suy nghĩ của Gemini. Để trống = không đổi. Gemini Flash: 0 = tắt suy nghĩ (tiết kiệm nhất), 1024 = nhẹ. Gemini Pro: không nhập 0"
+        type: string
+        default: ""
+      installed_version:
+        description: "Phiên bản app ĐANG CÀI trên máy (vd 1.9.1.31). Workflow đọc tên gói + versionCode từ APK của release v<phiên bản> này để build đúng gói đó, nên cập nhật ĐÈ chứ không đẻ app mới. Để trống = theo release mới nhất"
+        type: string
+        default: "1.9.1.31"
+      package_name:
+        description: "Tên gói của APK. Mặc định com.bit.dev = app tên Bit Dev (bản build từ workflow này). auto = đọc từ APK của release installed_version (chỉ dùng được khi release đó còn trong repo). Ép tay thì chọn đúng gói của app đang cài: Bit Dev = com.bit.dev | BitChord = com.music.bitchord | BitChord Dev = com.dev.bitchord"
+        type: choice
+        options:
+          - com.bit.dev
+          - auto
+          - com.music.bitchord
+          - com.dev.bitchord
+        default: com.bit.dev
+      publish_release:
+        description: "Đăng APK lên mục Releases (cần để app cập nhật trong app được). Tắt = chỉ có file ở Artifacts"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: gemini-vi-lyrics-lite-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gemini-vi:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      BIT_DEV_BUILD: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: gradle
+
+      - name: Decide the package name from the INSTALLED app (sai gói = Android cài thành app MỚI)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WANT_PKG: ${{ inputs.package_name }}
+          INSTALLED_VERSION: ${{ inputs.installed_version }}
+        run: |
+          set -uo pipefail
+          set +e   # runner chạy bash với -e; tắt đi để lệnh ls/grep không tìm thấy gì không làm cả bước chết im lặng
+          WANT_PKG="${WANT_PKG:-auto}"
+          INST="${INSTALLED_VERSION:-}"; INST="${INST//[[:space:]]/}"; INST="${INST#v}"
+          if [ -n "$INST" ] && ! [[ "$INST" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
+            echo "::error::installed_version '$INST' sai định dạng (ví dụ đúng: 1.9.1.31)."
+            exit 1
+          fi
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          AAPT2="$(ls "$SDK"/build-tools/*/aapt2 2>/dev/null | sort -V | tail -n 1)"
+          if [ -z "$AAPT2" ]; then
+            AAPT2="$(find /usr/local/lib/android /opt /usr/lib/android-sdk -name aapt2 -type f 2>/dev/null | sort -V | tail -n 1)"
+          fi
+          echo "SDK=$SDK | aapt2=${AAPT2:-không thấy}"
+          if [ -z "$AAPT2" ]; then
+            if [ "$WANT_PKG" = "auto" ]; then
+              echo "::error::Không thấy aapt2 trên runner nên không đọc được tên gói của APK. Chọn tay package_name."
+              exit 1
+            fi
+            echo "::warning::Không thấy aapt2 trên runner, bỏ qua bước đọc APK cũ, dùng gói chọn tay."
+          fi
+          badge() { "$AAPT2" dump badging "$1" 2>/dev/null; }
+          apk_pkg() { badge "$1" | grep -oP "package: name='\K[^']+" | head -n 1; }
+          apk_code() { badge "$1" | grep -oP "versionCode='\K[0-9]+" | head -n 1; }
+
+          # 1) APK của đúng bản đang cài (release tag v<installed_version>): tên gói + versionCode của app trên máy.
+          REF_PKG=""; REF_CODE=0
+          if [ -n "$INST" ] && [ -n "$AAPT2" ]; then
+            RD="$RUNNER_TEMP/installed-apk"; rm -rf "$RD"; mkdir -p "$RD"
+            # Thử tag v<ver> và <ver>; không có thì tìm release nào có tag / tên / tên file chứa đúng số phiên bản.
+            TAGS_TRY="v$INST $INST"
+            FOUND_TAG="$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" --paginate --jq '.[] | select(((.tag_name // "") + " " + (.name // "") + " " + ([.assets[].name] | join(" "))) | contains("'"$INST"'")) | .tag_name' 2>/dev/null | head -n 1)"
+            if [ -n "$FOUND_TAG" ]; then TAGS_TRY="$FOUND_TAG $TAGS_TRY"; fi
+            for T in $TAGS_TRY; do
+              gh release download "$T" --repo "$GITHUB_REPOSITORY" --pattern '*.apk' --dir "$RD" --clobber > /dev/null 2>&1 && break
+            done
+            RF="$(ls "$RD"/Bit-*.apk "$RD"/*.apk 2>/dev/null | head -n 1)"
+            if [ -n "$RF" ]; then
+              REF_PKG="$(apk_pkg "$RF")"; REF_CODE="$(apk_code "$RF")"; REF_CODE="${REF_CODE:-0}"
+              echo "REF_APK=$RF" >> "$GITHUB_ENV"
+            fi
+          fi
+
+          # 2) Chọn gói: chọn tay > gói của bản đang cài > gói của release mới nhất.
+          PKG=""; SRC=""
+          if [ "$WANT_PKG" != "auto" ]; then
+            PKG="$WANT_PKG"; SRC="chọn tay ở input package_name"
+          elif [ -n "$REF_PKG" ]; then
+            PKG="$REF_PKG"; SRC="đọc từ APK của release v$INST (bản đang cài trên máy)"
+          elif [ -n "$INST" ]; then
+            REL="$(gh release list --repo "$GITHUB_REPOSITORY" --limit 30 2>&1 | head -n 40)"
+            echo "Các release hiện có trong repo:"; echo "$REL"
+            {
+              echo "### Không thấy APK của bản đang cài v$INST"
+              echo "Release hiện có trong repo:"
+              echo '```'; echo "$REL"; echo '```'
+              echo "Cách làm: chạy lại và chọn package_name theo TÊN app trên máy: Bit Dev = com.bit.dev | BitChord = com.music.bitchord | BitChord Dev = com.dev.bitchord. Hoặc sửa installed_version cho đúng một phiên bản có trong danh sách trên."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::Không thấy release nào chứa APK của v$INST nên không biết app trên máy là gói nào. Chạy lại và chọn tay package_name (theo tên app trên máy), hoặc sửa installed_version. Danh sách release ở trên và ở Summary."
+            exit 1
+          fi
+
+          # 3) APK của release mới nhất: dùng làm gói dự phòng (khi installed_version để trống) và để biết versionCode cao nhất cùng gói.
+          LAT_PKG=""; LAT_CODE=0
+          if [ -n "$AAPT2" ]; then
+            LD="$RUNNER_TEMP/latest-apk"; rm -rf "$LD"; mkdir -p "$LD"
+            if gh release download --repo "$GITHUB_REPOSITORY" --pattern 'Bit-*.apk' --dir "$LD" --clobber > /dev/null 2>&1; then
+              LF="$(ls "$LD"/*.apk 2>/dev/null | head -n 1)"
+              if [ -n "$LF" ]; then LAT_PKG="$(apk_pkg "$LF")"; LAT_CODE="$(apk_code "$LF")"; LAT_CODE="${LAT_CODE:-0}"; fi
+            fi
+          fi
+          if [ -z "$PKG" ]; then
+            if [ -n "$LAT_PKG" ]; then
+              PKG="$LAT_PKG"; SRC="đọc từ APK của release mới nhất"
+            else
+              PKG="com.bit.dev"; SRC="mặc định (không đọc được APK nào)"
+              echo "::warning::Không đọc được tên gói từ release nào, dùng mặc định com.bit.dev. Nếu app trên máy là gói khác, chạy lại và chọn tay package_name."
+            fi
+          fi
+          if ! [[ "$PKG" =~ ^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$ ]]; then
+            echo "::error::Tên gói '$PKG' không hợp lệ."
+            exit 1
+          fi
+
+          # 4) versionCode phải cao hơn mọi bản cùng gói đã biết (bản đang cài + release mới nhất), nếu không Android báo hạ phiên bản.
+          MAXC=0
+          if [ "$REF_PKG" = "$PKG" ] && (( REF_CODE > MAXC )); then MAXC=$REF_CODE; fi
+          if [ "$LAT_PKG" = "$PKG" ] && (( LAT_CODE > MAXC )); then MAXC=$LAT_CODE; fi
+          MIN_CODE=0; if (( MAXC > 0 )); then MIN_CODE=$(( MAXC + 1 )); fi
+
+          echo "APP_PKG=$PKG" >> "$GITHUB_ENV"
+          echo "MIN_CODE=$MIN_CODE" >> "$GITHUB_ENV"
+          {
+            echo "- Tên gói của APK: $PKG ($SRC). App trên máy phải cùng gói này thì mới cập nhật đè, khác gói là Android cài thêm app mới."
+            echo "- Bản đang cài (installed_version): ${INST:-không khai} | gói đọc được: ${REF_PKG:-?} (versionCode ${REF_CODE}) | release mới nhất: gói ${LAT_PKG:-?} (versionCode ${LAT_CODE}) | versionCode tối thiểu cho bản này: ${MIN_CODE}"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Tên gói: $PKG ($SRC) | versionCode tối thiểu: $MIN_CODE"
+          if [ -n "$REF_PKG" ] && [ -n "$LAT_PKG" ] && [ "$REF_PKG" != "$LAT_PKG" ]; then
+            echo "::warning::Release mới nhất ($LAT_PKG) KHÁC gói bản đang cài ($REF_PKG): có workflow khác đã đăng APK gói khác vào kênh cập nhật. Bản build lần này dùng gói $PKG."
+          fi
+
+      - name: Rebuild the base (all-in-one + Gemini translation)
+        if: ${{ !inputs.skip_base }}
+        shell: bash
+        env:
+          BASE_FILE: ${{ inputs.base_file }}
+          CHAIN_FILE: ${{ inputs.chain_file }}
+        run: |
+          set -euo pipefail
+          LT=shared/src/jvmSharedMain/kotlin/com/music/bitchord/data/lyrics/LyricsTranslation.kt
+          if grep -q "GEMINI_ENDPOINT" "$LT"; then
+            echo "Repo đã có Gemini trong LyricsTranslation.kt, bỏ qua bước dựng lại."
+            exit 0
+          fi
+          cat > "$RUNNER_TEMP/replay_base.py" <<'REPLAY_EOF'
+          import os, re, subprocess, sys
+
+          try:
+              import yaml
+          except ImportError:
+              subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "--break-system-packages", "pyyaml"])
+              import yaml
+
+          name = os.environ["BASE_FILE"]
+          chain = os.environ["CHAIN_FILE"]
+          path = os.path.join(".github", "workflows", name)
+          if not os.path.isfile(path):
+              sys.exit(f"::error::Không thấy .github/workflows/{name}. Workflow này cần file đó để có sẵn phần Gemini (hoặc nhập đúng tên ở input base_file).")
+
+          doc = yaml.safe_load(open(path, encoding="utf8"))
+          steps = next(iter(doc["jobs"].values()))["steps"]
+          first = next((i for i, s in enumerate(steps) if s.get("name") == "Rebuild the all-in-one features"), None)
+          last = next((i for i, s in enumerate(steps) if s.get("name") == "Commit the patch locally"), None)
+          if first is None or last is None or last <= first:
+              sys.exit(f"::error::{name} không có cấu trúc như mong đợi (bước 'Rebuild the all-in-one features' ... 'Commit the patch locally'). Gửi lại file đó để mình chỉnh.")
+
+          EXPR = "$" + "{{"
+          CHAIN_RE = re.compile(r"\$\{\{\s*inputs\.chain_file\s*\}\}")
+          OTHER_RE = re.compile(r"\$\{\{\s*inputs\.\w+(\s*&&\s*inputs\.\w+)*\s*\}\}")
+
+          todo = [s for s in steps[first:last] if s.get("run")]
+          print(f"Dựng lại {len(todo)} bước từ {name}")
+          for s in todo:
+              run = CHAIN_RE.sub(lambda m: chain, s["run"])
+              run = OTHER_RE.sub("true", run)
+              if EXPR in run:
+                  sys.exit(f"::error::Bước '{s.get('name')}' còn biểu thức GitHub chưa xử lý được.")
+              env = dict(os.environ)
+              for k, v in (s.get("env") or {}).items():
+                  env[k] = OTHER_RE.sub("false", CHAIN_RE.sub(lambda m: chain, str(v)))
+              print(f"::group::{s.get('name')}", flush=True)
+              r = subprocess.run(["bash", "-eo", "pipefail", "-c", run], env=env)
+              print("::endgroup::", flush=True)
+              if r.returncode != 0:
+                  sys.exit(f"::error::Bước '{s.get('name')}' của {name} lỗi (mã {r.returncode}).")
+          print("Đã dựng xong bản nền (all-in-one + Gemini).")
+
+          REPLAY_EOF
+          python3 "$RUNNER_TEMP/replay_base.py"
+
+      - name: Apply the Vietnamese lyricist prompt to Gemini (nhận diện xưng hô + lượt rà xưng hô)
+        shell: bash
+        env:
+          USE_SEARCH: ${{ inputs.use_search }}
+          USE_REVIEW: ${{ inputs.review_pass }}
+          THINKING_BUDGET: ${{ inputs.thinking_budget }}
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/vi_prompt.py" <<'VI_EOF'
+          import os, re, sys
+
+          USE_SEARCH = os.environ.get("USE_SEARCH", "false").strip().lower() == "true"
+          USE_REVIEW = os.environ.get("USE_REVIEW", "false").strip().lower() == "true"
+          THINKING = os.environ.get("THINKING_BUDGET", "").strip()
+          if THINKING and not re.fullmatch(r"-?\d+", THINKING):
+              sys.exit("::error::thinking_budget phải là số nguyên (hoặc để trống).")
+
+          PATH = "shared/src/jvmSharedMain/kotlin/com/music/bitchord/data/lyrics/LyricsTranslation.kt"
+          src = open(PATH, encoding="utf8").read()
+
+          if "GEMINI_CONTEXT_INSTRUCTION" in src:
+              print("Bản vá Gemini (xưng hô) đã có sẵn, bỏ qua.")
+              sys.exit(0)
+          if "GEMINI_ENDPOINT" not in src or "requestGemini" not in src:
+              sys.exit("::error::LyricsTranslation.kt chưa có phần Gemini (patch automix-manual-mix chưa được áp).")
+
+          BRACES_BEFORE = src.count("{") - src.count("}")
+          PARENS_BEFORE = src.count("(") - src.count(")")
+
+
+          def once(text, old, new, what):
+              n = text.count(old)
+              if n != 1:
+                  sys.exit(f"::error::Không vá được '{what}': tìm thấy {n} chỗ khớp (cần đúng 1). Gửi lại LyricsTranslation.kt để mình chỉnh.")
+              return text.replace(old, new)
+
+
+          def line_bounds(text, needle, what):
+              n = text.count(needle)
+              if n != 1:
+                  sys.exit(f"::error::Không vá được '{what}': tìm thấy {n} chỗ khớp (cần đúng 1).")
+              pos = text.index(needle)
+              start = text.rfind("\n", 0, pos) + 1
+              end = text.index("\n", pos) + 1
+              indent = re.match(r"[ \t]*", text[start:end]).group(0)
+              return start, end, indent
+
+
+          def replace_line(text, needle, lines, what):
+              start, end, indent = line_bounds(text, needle, what)
+              return text[:start] + "".join((indent + l if l else "") + "\n" for l in lines) + text[end:]
+
+
+          def insert_before(text, needle, lines, what):
+              start, _, indent = line_bounds(text, needle, what)
+              return text[:start] + "".join((indent + l if l else "") + "\n" for l in lines) + text[start:]
+
+
+          def insert_after(text, needle, lines, what):
+              _, end, indent = line_bounds(text, needle, what)
+              return text[:end] + "".join((indent + l if l else "") + "\n" for l in lines) + text[end:]
+
+
+          # ---------------------------------------------------------------------------------------------
+          # 1) Hằng số: prompt dịch giả tiếng Việt (v2) + prompt tra cứu bài hát
+          # ---------------------------------------------------------------------------------------------
+          CONSTS = r'''    private const val GEMINI_MAX_CHARS = 7_000
+              private const val GEMINI_CONTEXT_MAX_CHARS = 1_500
+              // Tra cứu bài hát bằng Google Search trước khi dịch: chính xác hơn nhưng chậm hơn và tốn quota (chọn lúc chạy workflow).
+              private const val GEMINI_USE_SEARCH = __USE_SEARCH__
+              // Lượt rà xưng hô riêng sau khi dịch: tốn thêm một lời gọi (chọn lúc chạy workflow).
+              private const val GEMINI_USE_REVIEW = __USE_REVIEW__
+
+              // Prompt viết bằng tiếng Anh (ít token, Gemini hiểu tốt); đầu ra vẫn là tiếng Việt.
+              // Chia 3 khối để dùng lại: NHẬN DIỆN (ai hát, hát cho ai, chọn cặp) + DẠNG ĐẠI TỪ (dùng chung với lượt rà) + phong cách/JSON.
+              private val GEMINI_VI_PRONOUN_PLAN = """
+                  PRONOUN PLAN (decide this BEFORE writing any line)
+                  Read the whole song, then settle:
+                  1. SINGER (the "I"): gender, age feel, role (lover, ex, friend, child, parent, rapper, narrator, crowd, worshipper).
+                  2. LISTENER (the "you"): lover, ex, friend, rival, family member, crowd, oneself, God, or a place/thing.
+                  3. RELATION + REGISTER: tender, casual, cold, hostile, respectful, playful, street, solemn.
+
+                  Evidence, strongest first:
+                  a. SONG NOTES or a pair locked in a previous part: trust them, unless the lyrics plainly contradict them.
+                  b. Explicit cues: how the singer labels themself (girl, boy, man, woman, mama, daddy, wife, husband, king, queen); how the singer labels the listener (my man, my girl, boyfriend, girlfriend, baby girl, sir, ma'am, mom, bro, sis); he/she/his/her aimed at the loved one.
+                  c. Context: genre and delivery (love ballad, breakup, diss or battle rap, party, hymn, lullaby); who begs, flexes, scolds or comforts whom.
+                  d. Weak hints that never decide alone: baby, babe, honey, darling, dear, love, girl/boy/bro between friends, and the artist's name.
+                  "He" for the loved one with no cue about the singer usually means a woman is singing (em - anh); "she" usually means a man (anh - em). Same-sex songs exist, so explicit cues always win.
+                  Never default to a male singer or to "anh - em". If cues are truly missing, use the neutral options below.
+
+                  CHOOSE ONE PAIR (singer - listener)
+                  - Lovers, tender: man to woman anh - em; woman to man em - anh; same-sex lovers: anh - em, em - anh, chị - em or em - chị, following the age and role feel.
+                  - Romantic but gender unknown: drop the subject where Vietnamese allows; otherwise tôi - người (poetic, sad), tớ - cậu (young, sweet), mình - bạn (plain). Do not guess anh - em.
+                  - Ex or bitter breakup: tôi - anh or tôi - em (a cold "tôi" signals distance); furious: tao - mày.
+                  - Friends: tớ - cậu (young, soft), mình - bạn or tôi - bạn (neutral), tao - mày (very casual, street).
+                  - Rival, diss, hate, flexing: tao - mày; for groups tao - tụi mày / chúng mày / bọn mày.
+                  - Crowd, party, anthem: tôi or mình - mọi người / các bạn.
+                  - Parent to child: mẹ - con or ba - con; child to parent: con - mẹ or con - ba; grandparent: bà or ông - cháu; to an elder: cháu - cô / chú / bác.
+                  - Prayer, God, spirit, fate: con - Chúa / Người / Trời.
+                  - Self-talk with no listener: tôi or mình (self-scolding may use mày).
+                  - Solemn, epic, ancient, fantasy: ta - ngươi or ta - người.
+                  - Poetic "you" that is a city, the night, a memory: tôi - em or tôi - người.
+              """.trimIndent()
+
+              private val GEMINI_VI_PRONOUN_FORMS = """
+                  PRONOUN FORMS (every line must agree with the locked pair)
+                  - Self-reference, address and possessives all use the pair: "my heart" = "tim anh" in anh - em, never "tim tôi" or "tim em"; "your eyes" = "mắt em". Never mix registers (tao - em, tôi - mày) unless the lyrics do.
+                  - Vocatives follow the pair: baby/babe/honey = "em" when the singer is anh, "anh" when the singer is em, "người ơi" in poetic neutral songs.
+                  - Third person: he = anh ấy / chàng (tender) or hắn / gã / thằng đó (hostile); she = cô ấy / nàng (tender) or ả / con đó (hostile); an unknown person = người ấy; they = họ / bọn họ / tụi nó. Always match the real gender and the register.
+                  - We/us = chúng ta (includes the listener), chúng mình (intimate), tụi mình (casual), chúng tôi (excludes the listener). You (plural) = các bạn / mọi người / tụi mày.
+                  - Change the pair only when the speaker or listener truly changes (duet, dialogue, a verse aimed at someone else). Each voice then keeps its own pair, and "analysis" must say so.
+                  - Dropping a pronoun is fine when rhythm or poetry prefers it. Never switch pair mid-song just to dodge an awkward line.
+              """.trimIndent()
+
+              private val GEMINI_VI_INSTRUCTION = """
+                  You are a professional lyricist-translator. Translate song lyrics into natural, singable Vietnamese.
+              """.trimIndent() + "\n\n" + GEMINI_VI_PRONOUN_PLAN + "\n\n" + GEMINI_VI_PRONOUN_FORMS + "\n\n" + """
+                  STYLE
+                  - Keep meaning and emotion, never word by word. Turn imagery and metaphor into natural, concise, rhythmic, poetic Vietnamese lyrics; light rhyme when it fits. Do not invent plot.
+                  - Render slang, swearing and double meanings with Vietnamese slang of the same register. No softening, no censoring. Keep names and brands unchanged.
+                  - Translate foreign phrases mixed into the song too. Keep only pure vocalizations (oh, yeah, la la la) and lines already in Vietnamese.
+                  - Before answering, recheck every line: self-reference, address, possessives, he/she and tense.
+
+                  OUTPUT: one JSON object with keys in this order:
+                  - "analysis": max 40 words, format "Singer: ...; Listener: ...; Cues: ...; Register: ...; Exceptions: ...". Example: "Singer: woman (cue: my man); Listener: her lover; Cues: he/him; Register: tender, sad; Exceptions: none." Never put it in "lines".
+                  - "pair": the main pair as "singer - listener", e.g. "em - anh". Add a second pair only for a duet or a real change, e.g. "em - anh / anh - em".
+                  - "source": ISO 639-1 code of the main sung language.
+                  - "lines": exactly one translated string per input line, same order. Never merge, split, drop, add or leave a line empty. No explanations.
+              """.trimIndent()
+
+              // Bước tra cứu (có Google Search) chạy trước khi dịch. Chỉ model đọc nên viết tiếng Anh, ngắn.
+              private val GEMINI_CONTEXT_INSTRUCTION = """
+                  You are a music researcher. Use Google Search to identify the song (title, artist) and what it is about. Trust only what you find or can infer from the lyrics; otherwise write "unknown".
+                  Reply in English, max 130 words, short bullets: Song; Story; Singer persona (gender, age feel, role; artist gender; duet or featured voices); Listener (who is addressed, gender, relationship); Suggested Vietnamese pronoun pair (with exceptions per section); Slang and metaphors (with meaning).
+                  Do not translate or quote the lyrics.
+              """.trimIndent()
+
+              // Lượt rà xưng hô (chỉ khi bật review_pass): chỉ nhận kế hoạch + bản dịch, sửa đại từ lệch.
+              private val GEMINI_REVIEW_INSTRUCTION = """
+                  You are a Vietnamese lyric editor who fixes ONLY pronouns. Input JSON: "plan" (the locked pair and analysis, including any stated change of speaker or listener) and "translated" (lines).
+                  Check every line against the plan and fix any word that deviates: self-reference, address, possessives, vocatives, third person (gender and register), we/us. Leave a line unchanged when it is already correct.
+                  Change only the wrong pronoun words. Keep the meaning, rhythm and every other word. Do not add pronouns to lines that drop them.
+              """.trimIndent() + "\n\n" + GEMINI_VI_PRONOUN_FORMS + "\n\n" + """
+                  Return {"lines": [...]} with the same number of lines in the same order, none empty, no explanations.
+              """.trimIndent()
+          '''
+          src = once(src, "    private const val GEMINI_MAX_CHARS = 7_000\n", CONSTS.replace("__USE_SEARCH__", "true" if USE_SEARCH else "false").replace("__USE_REVIEW__", "true" if USE_REVIEW else "false"), "hằng GEMINI_MAX_CHARS")
+
+          # ---------------------------------------------------------------------------------------------
+          # 2) Prompt tiếng Anh cũ vẫn dùng cho ngôn ngữ đích khác; chọn prompt theo ngôn ngữ đích
+          # ---------------------------------------------------------------------------------------------
+          src = once(src, 'val instruction = "You translate song lyrics.', 'val englishInstruction = "You translate song lyrics.', "prompt tiếng Anh")
+
+          m = re.search(r'^([ \t]*)\+?[^\n]*ignoring the mixed-in foreign lines\."\n', src, re.M)
+          if not m or len(re.findall(r'ignoring the mixed-in foreign lines\."\n', src)) != 1:
+              sys.exit("::error::Không tìm thấy cuối prompt tiếng Anh trong requestGemini.")
+          base_ind = re.search(r'^([ \t]*)val englishInstruction', src, re.M).group(1)
+          pick = (
+              base_ind + 'val vietnamese = target.startsWith("vi", ignoreCase = true)\n'
+              + base_ind + 'val instruction = if (vietnamese) GEMINI_VI_INSTRUCTION else englishInstruction\n'
+              + base_ind + '// Tiếng Việt: buộc Gemini chốt xưng hô vào trường "analysis" trước khi viết các dòng dịch.\n'
+              + base_ind + 'val planFirst = vietnamese\n'
+          )
+          src = src[:m.end()] + pick + src[m.end():]
+
+          # Ghi chú tra cứu được nối vào system instruction.
+          src = once(src, 'put("text", instruction)', 'put("text", withSongNotes(instruction, context))', "systemInstruction")
+
+          # requestGemini nhận thêm ghi chú bài hát (mặc định null).
+          rg = re.compile(r"(private suspend fun requestGemini\(\n(?P<i>[ \t]*)slots: List<TextSlot>,\n[ \t]*target: String,\n[ \t]*settings: GeminiSettings,\n)")
+          mm = rg.search(src)
+          if not mm or len(rg.findall(src)) != 1:
+              sys.exit("::error::Không tìm thấy chữ ký hàm requestGemini để thêm tham số ghi chú.")
+          src = src[:mm.end()] + mm.group("i") + "context: String? = null,\n" + src[mm.end():]
+
+          # ---------------------------------------------------------------------------------------------
+          # 3) Schema: thêm "analysis" (đứng đầu) khi dịch tiếng Việt
+          # ---------------------------------------------------------------------------------------------
+          src = insert_after(src, 'putJsonObject("properties") {', [
+              '    if (planFirst) putJsonObject("analysis") { put("type", "STRING") }',
+              '    if (planFirst) putJsonObject("pair") { put("type", "STRING") }',
+          ], 'schema properties')
+          # "required" trước (khi 'add(JsonPrimitive("source"))' còn duy nhất), rồi mới chèn propertyOrdering.
+          src = insert_before(src, 'add(JsonPrimitive("source"))', [
+              'if (planFirst) add(JsonPrimitive("analysis"))',
+              'if (planFirst) add(JsonPrimitive("pair"))',
+          ], 'required analysis')
+          src = insert_before(src, 'putJsonArray("required") {', [
+              'if (planFirst) putJsonArray("propertyOrdering") {',
+              '    add(JsonPrimitive("analysis"))',
+              '    add(JsonPrimitive("pair"))',
+              '    add(JsonPrimitive("source"))',
+              '    add(JsonPrimitive("lines"))',
+              '}',
+          ], 'propertyOrdering')
+
+          # ---------------------------------------------------------------------------------------------
+          # 4) temperature, safetySettings
+          # ---------------------------------------------------------------------------------------------
+          # temperature giữ nguyên 0.3: thấp hơn thì chọn đại từ ổn định hơn giữa các dòng và giữa các đoạn.
+
+          gm = re.findall(r'^([ \t]*)putJsonObject\("generationConfig"\) \{\n', src, re.M)
+          if len(gm) != 1:
+              sys.exit(f"::error::Không vá được 'generationConfig': tìm thấy {len(gm)} chỗ (cần đúng 1).")
+          i = gm[0]
+          SAFETY = (
+              f'{i}putJsonArray("safetySettings") {{\n'
+              f'{i}    // Lời bài hát đầy tiếng lóng, chửi thề và nghĩa đôi: không để bộ lọc của Gemini chặn.\n'
+              f'{i}    listOf(\n'
+              f'{i}        "HARM_CATEGORY_HARASSMENT",\n'
+              f'{i}        "HARM_CATEGORY_HATE_SPEECH",\n'
+              f'{i}        "HARM_CATEGORY_SEXUALLY_EXPLICIT",\n'
+              f'{i}        "HARM_CATEGORY_DANGEROUS_CONTENT",\n'
+              f'{i}    ).forEach {{ category ->\n'
+              f'{i}        addJsonObject {{\n'
+              f'{i}            put("category", category)\n'
+              f'{i}            put("threshold", "BLOCK_NONE")\n'
+              f'{i}        }}\n'
+              f'{i}    }}\n'
+              f'{i}}}\n'
+          )
+          anchor = f'{i}putJsonObject("generationConfig") {{\n'
+          src = once(src, anchor, SAFETY + anchor, "generationConfig")
+          # Giới hạn token suy nghĩ (để trống = không đổi).
+          if THINKING:
+              src = insert_after(src, 'putJsonObject("generationConfig") {', [
+                  f'    putJsonObject("thinkingConfig") {{ put("thinkingBudget", {int(THINKING)}) }}',
+              ], "thinkingConfig")
+
+          # ---------------------------------------------------------------------------------------------
+          # 5) Timeout dài hơn. Http.client có readTimeout 30 giây: Gemini chỉ trả về khi viết xong cả bài,
+          #    nên phải nâng cả readTimeout chứ không chỉ callTimeout.
+          # ---------------------------------------------------------------------------------------------
+          src = once(
+              src,
+              ".callTimeout(45, TimeUnit.SECONDS)\n",
+              ".callTimeout(150, TimeUnit.SECONDS)\n            .readTimeout(150, TimeUnit.SECONDS)\n",
+              "callTimeout Gemini",
+          )
+          src = once(src, ".connectTimeout(8, TimeUnit.SECONDS)\n", ".connectTimeout(10, TimeUnit.SECONDS)\n", "connectTimeout Gemini")
+          src = insert_before(src, "private val client by lazy {", [
+              "// Bước tra cứu bài hát (Google Search) cũng cần thời gian; hết giờ thì dịch tiếp không có ghi chú.",
+              "private val geminiContextClient by lazy {",
+              "    geminiClient.newBuilder()",
+              "        .callTimeout(75, TimeUnit.SECONDS)",
+              "        .readTimeout(75, TimeUnit.SECONDS)",
+              "        .build()",
+              "}",
+              "// Lượt rà xưng hô ngắn hơn lượt dịch; hết giờ thì giữ bản dịch đầu.",
+              "private val geminiReviewClient by lazy {",
+              "    geminiClient.newBuilder()",
+              "        .callTimeout(60, TimeUnit.SECONDS)",
+              "        .readTimeout(60, TimeUnit.SECONDS)",
+              "        .build()",
+              "}",
+          ], "client Google")
+
+          # ---------------------------------------------------------------------------------------------
+          # 6) Tra cứu bài hát một lần cho cả bài (mọi đoạn chia nhỏ dùng chung một ghi chú, nên xưng hô khớp nhau)
+          # ---------------------------------------------------------------------------------------------
+          src = insert_before(src, "val texts = mutableListOf<String>()", [
+              "// Chỉ tiếng Việt cần chốt xưng hô. Tra cứu (nếu bật) chạy một lần, dùng chung cho mọi đoạn; lỗi hay hết giờ thì dịch không có ghi chú.",
+              'val vietnamese = target.startsWith("vi", ignoreCase = true)',
+              "val context = if (GEMINI_USE_SEARCH && vietnamese) researchSong(slots, settings) else null",
+              "var carried = context",
+          ], "researchSong call")
+          src = replace_line(src, "val answer = requestGemini(chunk, target, settings) ?: return null", [
+              "val first = requestGemini(chunk, target, settings, carried) ?: return null",
+              "// Tiếng Việt: một lượt rà riêng chỉ để bắt lỗi xưng hô. Lỗi hay lệch số dòng thì giữ bản dịch đầu.",
+              "val answer = if (GEMINI_USE_REVIEW && vietnamese && first.plan.isNotBlank()) {",
+              "    reviewPronouns(chunk, first.texts, first.plan, settings)",
+              "        ?.let { GeminiAnswer(it, first.sourceLanguage, first.plan) } ?: first",
+              "} else {",
+              "    first",
+              "}",
+              "// Đoạn sau giữ đúng cặp xưng hô đã chốt ở đoạn trước.",
+              "if (answer.plan.isNotBlank()) {",
+              '    carried = listOfNotNull(context, "Pronouns locked in the previous part, keep:\\n" + answer.plan).joinToString("\\n\\n")',
+              "}",
+          ], "gọi requestGemini")
+
+          HELPERS = r'''    /** Ghi chú tra cứu nối vào cuối system instruction; không có ghi chú thì giữ nguyên. */
+              private fun withSongNotes(instruction: String, notes: String?): String =
+                  if (notes.isNullOrBlank()) {
+                      instruction
+                  } else {
+                      instruction + "\n\nSONG NOTES (researched; use for pronouns and context; do not translate or output):\n" + notes
+                  }
+
+              /**
+               * Hỏi Gemini (có Google Search) về bài hát trước khi dịch: tên, câu chuyện, ai hát cho ai, nghĩa tiếng lóng,
+               * cặp xưng hô nên dùng. Null khi lỗi hay hết giờ, khi đó vẫn dịch bình thường, chỉ thiếu ghi chú.
+               */
+              private suspend fun researchSong(slots: List<TextSlot>, settings: GeminiSettings): String? {
+                  val lyric = slots.joinToString("\n") { it.text }.take(GEMINI_MAX_CHARS)
+                  val body = buildJsonObject {
+                      putJsonObject("systemInstruction") {
+                          putJsonArray("parts") { addJsonObject { put("text", GEMINI_CONTEXT_INSTRUCTION) } }
+                      }
+                      putJsonArray("contents") {
+                          addJsonObject {
+                              put("role", "user")
+                              putJsonArray("parts") { addJsonObject { put("text", lyric) } }
+                          }
+                      }
+                      putJsonArray("tools") {
+                          addJsonObject { putJsonObject("google_search") {} }
+                      }
+                      putJsonArray("safetySettings") {
+                          listOf(
+                              "HARM_CATEGORY_HARASSMENT",
+                              "HARM_CATEGORY_HATE_SPEECH",
+                              "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+                              "HARM_CATEGORY_DANGEROUS_CONTENT",
+                          ).forEach { category ->
+                              addJsonObject {
+                                  put("category", category)
+                                  put("threshold", "BLOCK_NONE")
+                              }
+                          }
+                      }
+                      putJsonObject("generationConfig") { put("temperature", 0.3) }
+                  }
+                  val request = Request.Builder()
+                      .url("$GEMINI_ENDPOINT${geminiModel(settings)}:generateContent")
+                      .header("x-goog-api-key", settings.apiKey.trim())
+                      .header("User-Agent", "BitChord/1.7.1")
+                      .post(body.toString().toRequestBody("application/json".toMediaType()))
+                      .build()
+                  val response = try {
+                      geminiContextClient.newCall(request).awaitBody()
+                  } catch (cancelled: CancellationException) {
+                      throw cancelled
+                  } catch (_: IOException) {
+                      return null
+                  }
+                  return runCatching {
+                      val root = json.parseToJsonElement(response).jsonObject
+                      root["candidates"]!!.jsonArray[0].jsonObject["content"]!!.jsonObject["parts"]!!.jsonArray
+                          .joinToString("") { it.jsonObject["text"]?.jsonPrimitive?.contentOrNull.orEmpty() }
+                          .trim()
+                          .takeIf { it.isNotEmpty() }
+                          ?.take(GEMINI_CONTEXT_MAX_CHARS)
+                  }.getOrNull()
+              }
+
+          '''
+          REVIEW = r'''    /**
+               * Lượt rà xưng hô: một lời gọi riêng, chỉ có một việc là sửa đại từ lệch khỏi cặp đã chốt. Null khi lỗi hay
+               * lệch số dòng, khi đó giữ bản dịch đầu.
+               */
+              private suspend fun reviewPronouns(
+                  original: List<TextSlot>,
+                  translated: List<String>,
+                  plan: String,
+                  settings: GeminiSettings,
+              ): List<String>? {
+                  val payload = buildJsonObject {
+                      put("plan", plan)
+                      putJsonArray("translated") { translated.forEach { add(JsonPrimitive(it)) } }
+                  }
+                  val body = buildJsonObject {
+                      putJsonObject("systemInstruction") {
+                          putJsonArray("parts") { addJsonObject { put("text", GEMINI_REVIEW_INSTRUCTION) } }
+                      }
+                      putJsonArray("contents") {
+                          addJsonObject {
+                              put("role", "user")
+                              putJsonArray("parts") { addJsonObject { put("text", payload.toString()) } }
+                          }
+                      }
+                      putJsonArray("safetySettings") {
+                          listOf(
+                              "HARM_CATEGORY_HARASSMENT",
+                              "HARM_CATEGORY_HATE_SPEECH",
+                              "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+                              "HARM_CATEGORY_DANGEROUS_CONTENT",
+                          ).forEach { category ->
+                              addJsonObject {
+                                  put("category", category)
+                                  put("threshold", "BLOCK_NONE")
+                              }
+                          }
+                      }
+                      putJsonObject("generationConfig") {
+                          put("temperature", 0.1)
+                          __THINK_REVIEW__
+                          put("responseMimeType", "application/json")
+                          putJsonObject("responseSchema") {
+                              put("type", "OBJECT")
+                              putJsonObject("properties") {
+                                  putJsonObject("lines") {
+                                      put("type", "ARRAY")
+                                      putJsonObject("items") { put("type", "STRING") }
+                                  }
+                              }
+                              putJsonArray("required") { add(JsonPrimitive("lines")) }
+                          }
+                      }
+                  }
+                  val request = Request.Builder()
+                      .url("$GEMINI_ENDPOINT${geminiModel(settings)}:generateContent")
+                      .header("x-goog-api-key", settings.apiKey.trim())
+                      .header("User-Agent", "BitChord/1.7.1")
+                      .post(body.toString().toRequestBody("application/json".toMediaType()))
+                      .build()
+                  val response = try {
+                      geminiReviewClient.newCall(request).awaitBody()
+                  } catch (cancelled: CancellationException) {
+                      throw cancelled
+                  } catch (_: IOException) {
+                      return null
+                  }
+                  return runCatching {
+                      val root = json.parseToJsonElement(response).jsonObject
+                      val text = root["candidates"]!!.jsonArray[0].jsonObject["content"]!!.jsonObject["parts"]!!.jsonArray
+                          .joinToString("") { it.jsonObject["text"]?.jsonPrimitive?.contentOrNull.orEmpty() }
+                      val lines = json.parseToJsonElement(text).jsonObject["lines"]!!.jsonArray.map { it.jsonPrimitive.content.trim() }
+                      lines.takeIf { it.size == translated.size && it.none { line -> line.isBlank() } }
+                  }.getOrNull()
+              }
+
+          '''
+          if THINKING:
+              REVIEW = REVIEW.replace("__THINK_REVIEW__", 'putJsonObject("thinkingConfig") { put("thinkingBudget", %d) }' % int(THINKING))
+          else:
+              REVIEW = re.sub(r"[ \t]*__THINK_REVIEW__\n", "", REVIEW)
+          HELPERS = HELPERS + REVIEW
+          helper_lines = [l[4:] if l.startswith("    ") else l for l in HELPERS.rstrip("\n").split("\n")] + [""]
+          src = insert_before(src, "private class GeminiAnswer(", helper_lines, "helpers")
+
+          # ---------------------------------------------------------------------------------------------
+          # 6b) GeminiAnswer mang theo "plan" (cặp xưng hô + phân tích) để lượt rà và các đoạn sau dùng lại
+          # ---------------------------------------------------------------------------------------------
+          src = once(
+              src,
+              "private class GeminiAnswer(val texts: List<String>, val sourceLanguage: String)",
+              "private class GeminiAnswer(val texts: List<String>, val sourceLanguage: String, val plan: String = \"\")",
+              "GeminiAnswer",
+          )
+          src = insert_after(src, 'val source = answer["source"]?.jsonPrimitive?.contentOrNull.orEmpty()', [
+              "val plan = listOfNotNull(",
+              '    answer["pair"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }?.let { "Pair: " + it },',
+              '    answer["analysis"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }?.let { "Analysis: " + it },',
+              ').joinToString("\\n")',
+          ], "đọc plan")
+
+          # ---------------------------------------------------------------------------------------------
+          # 7) Dòng Gemini trả về rỗng: giữ lại dòng gốc thay vì bỏ cả bài rồi rơi về Google Dịch
+          # ---------------------------------------------------------------------------------------------
+          src = once(
+              src,
+              "if (translated.size != slots.size || translated.any { it.isBlank() }) return@runCatching null",
+              "if (translated.size != slots.size) return@runCatching null",
+              "kiểm tra dòng rỗng",
+          )
+          src = once(
+              src,
+              "GeminiAnswer(translated, source)",
+              "GeminiAnswer(translated.mapIndexed { index, text -> text.ifBlank { slots[index].text } }, source, plan)",
+              "dòng rỗng giữ gốc",
+          )
+
+          # ---------------------------------------------------------------------------------------------
+          # 8) Bản dịch cũ trong cache (làm bằng prompt cũ) không còn dùng: tăng phiên bản cache
+          # ---------------------------------------------------------------------------------------------
+          src = once(src, "CACHE_VERSION = 3", "CACHE_VERSION = 5", "CACHE_VERSION")
+
+          # ---------------------------------------------------------------------------------------------
+          # Kiểm tra: ngoặc phải cân bằng như trước, các khối mới phải có mặt
+          # ---------------------------------------------------------------------------------------------
+          if src.count("{") - src.count("}") != BRACES_BEFORE:
+              sys.exit("::error::Sau khi vá, số ngoặc nhọn bị lệch, dừng lại để khỏi build hỏng.")
+          if src.count("(") - src.count(")") != PARENS_BEFORE:
+              sys.exit("::error::Sau khi vá, số ngoặc tròn bị lệch, dừng lại để khỏi build hỏng.")
+          for must in ("withSongNotes(instruction, context)", "researchSong(slots, settings)", "geminiContextClient", "planFirst", "CACHE_VERSION = 5", "GEMINI_USE_REVIEW", "GEMINI_VI_PRONOUN_PLAN", "GEMINI_VI_PRONOUN_FORMS"):
+              if must not in src:
+                  sys.exit(f"::error::Thiếu '{must}' sau khi vá.")
+
+          open(PATH, "w", encoding="utf8").write(src)
+          print("Đã vá LyricsTranslation.kt (v4): nhận diện người hát/người nghe + chọn cặp xưng hô, lượt rà xưng hô riêng, "
+                "timeout 150s, dòng rỗng giữ gốc, cache v5, temperature 0.3, safetySettings BLOCK_NONE.")
+          VI_EOF
+          python3 "$RUNNER_TEMP/vi_prompt.py"
+          {
+            echo "## Gemini dịch lời: prompt xưng hô v4 (nhận diện người hát/người nghe)"
+            echo
+            echo "- Chốt xưng hô trước (PRONOUN PLAN: analysis + pair); lượt rà xưng hô riêng: ${USE_REVIEW}; thinking_budget: ${THINKING_BUDGET:-không đổi}"
+            echo "- Bài dài chia nhiều đoạn: cặp xưng hô đã chốt ở đoạn trước được truyền sang đoạn sau"
+            echo "- Tra cứu bài hát bằng Google Search: ${USE_SEARCH}"
+            echo "- Timeout dịch 150 giây, rà 60 giây, tra cứu 75 giây"
+            echo "- temperature = 0.3, safetySettings = BLOCK_NONE (4 mục), cache v5"
+            echo
+            git status --short | sed 's/^/    /'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Add the iOS 26 lock screen (màn khoá kiểu iOS 26, nền Canvas)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Base (automix-all-in-one) đã có sẵn một màn khoá đầy đủ. Thêm bản thứ hai làm hỏng build: trùng chuỗi lock_screen_player,
+          # và đè LockScreenLauncher.kt nên mất hàm install / requestOverlayPermission mà BitChordApplication + SettingsSheet của base đang gọi.
+          if [ -f app/src/main/java/com/music/bitchord/lockscreen/LockScreenActivity.kt ]; then
+            echo "Base đã có sẵn màn hình khoá (từ chuỗi automix-all-in-one), bỏ qua bước thêm màn khoá iOS 26."
+            {
+              echo
+              echo "### Màn khoá: dùng bản có sẵn trong base"
+              echo "- Bỏ qua bước màn khoá kiểu iOS 26 vì base đã có LockScreenActivity. Thêm bản thứ hai làm trùng chuỗi lock_screen_player và đè LockScreenLauncher (build hỏng)."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          D=app/src/main/java/com/music/bitchord/lockscreen
+          mkdir -p "$D" app/src/main/res/values
+          cat > "$D/LockScreenLauncher.kt" <<'KT_LAUNCHER_EOF'
+          package com.music.bitchord.lockscreen
+
+          import android.app.Application
+          import android.app.KeyguardManager
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.content.BroadcastReceiver
+          import android.content.Context
+          import android.content.Intent
+          import android.content.IntentFilter
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Handler
+          import android.os.Looper
+          import android.provider.Settings
+          import androidx.core.app.NotificationCompat
+          import androidx.core.content.ContextCompat
+          import com.music.bitchord.R
+          import com.music.bitchord.widget.MediaWidgetSnapshot
+          import kotlinx.coroutines.flow.MutableStateFlow
+
+          /**
+           * Bật/tắt màn khoá kiểu iOS 26. Lưu riêng một file prefs để không đụng vào AppSettings.
+           */
+          object LockScreenSettings {
+              private const val PREFS = "bitchord_lockscreen"
+              private const val KEY_ENABLED = "enabled"
+
+              val enabled = MutableStateFlow(true)
+
+              fun init(context: Context) {
+                  enabled.value = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                      .getBoolean(KEY_ENABLED, true)
+              }
+
+              fun set(context: Context, value: Boolean) {
+                  enabled.value = value
+                  context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                      .edit().putBoolean(KEY_ENABLED, value).apply()
+              }
+          }
+
+          /**
+           * Nghe sự kiện bật màn hình. Nếu máy đang khoá và Bit Dev đang phát nhạc thì mở
+           * [LockScreenActivity] đè lên màn khoá của hệ thống.
+           *
+           * Android 10+ chặn app mở Activity từ nền, nên có hai đường:
+           *  1. startActivity trực tiếp (chạy được khi app có quyền "hiển thị trên ứng dụng khác" hoặc hãng máy cho phép);
+           *  2. nếu sau ~0,6 giây Activity vẫn chưa lên thì đăng một thông báo full-screen-intent (màn khoá đang hiện
+           *     nên hệ thống sẽ mở Activity thay vì hiện thông báo).
+           */
+          object LockScreenLauncher {
+
+              private const val CHANNEL_ID = "lock_screen_player"
+              private const val NOTIFICATION_ID = 0x4C53
+              private val main = Handler(Looper.getMainLooper())
+              private var registered = false
+
+              fun init(app: Application) {
+                  if (registered) return
+                  registered = true
+                  LockScreenSettings.init(app)
+                  val receiver = object : BroadcastReceiver() {
+                      override fun onReceive(context: Context, intent: Intent) {
+                          when (intent.action) {
+                              Intent.ACTION_SCREEN_ON -> onScreenOn(context.applicationContext)
+                              Intent.ACTION_USER_PRESENT -> cancelNotification(context.applicationContext)
+                          }
+                      }
+                  }
+                  val filter = IntentFilter().apply {
+                      addAction(Intent.ACTION_SCREEN_ON)
+                      addAction(Intent.ACTION_USER_PRESENT)
+                  }
+                  ContextCompat.registerReceiver(app, receiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
+              }
+
+              private fun onScreenOn(context: Context) {
+                  if (!LockScreenSettings.enabled.value) return
+                  val keyguard = context.getSystemService(KeyguardManager::class.java) ?: return
+                  if (!keyguard.isKeyguardLocked) return
+                  val snapshot = runCatching { MediaWidgetSnapshot.load(context) }.getOrNull() ?: return
+                  if (!snapshot.hasTrack || !snapshot.isPlaying) return
+                  show(context)
+              }
+
+              private fun intentFor(context: Context) = Intent(context, LockScreenActivity::class.java).addFlags(
+                  Intent.FLAG_ACTIVITY_NEW_TASK or
+                      Intent.FLAG_ACTIVITY_NO_ANIMATION or
+                      Intent.FLAG_ACTIVITY_REORDER_TO_FRONT,
+              )
+
+              private fun show(context: Context) {
+                  runCatching { context.startActivity(intentFor(context)) }
+                  main.postDelayed({
+                      if (!LockScreenActivity.alive && LockScreenSettings.enabled.value) {
+                          postFullScreenNotification(context)
+                      }
+                  }, 600L)
+              }
+
+              private fun postFullScreenNotification(context: Context) {
+                  val nm = context.getSystemService(NotificationManager::class.java) ?: return
+                  if (Build.VERSION.SDK_INT >= 34 && !nm.canUseFullScreenIntent()) return
+                  if (Build.VERSION.SDK_INT >= 26) {
+                      val channel = NotificationChannel(
+                          CHANNEL_ID,
+                          "Màn khoá kiểu iOS 26",
+                          NotificationManager.IMPORTANCE_HIGH,
+                      ).apply {
+                          setSound(null, null)
+                          enableVibration(false)
+                          setShowBadge(false)
+                          lockscreenVisibility = android.app.Notification.VISIBILITY_SECRET
+                      }
+                      nm.createNotificationChannel(channel)
+                  }
+                  val pending = PendingIntent.getActivity(
+                      context,
+                      0,
+                      intentFor(context),
+                      PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+                  )
+                  val notification = NotificationCompat.Builder(context, CHANNEL_ID)
+                      .setSmallIcon(R.drawable.ic_notification_logo)
+                      .setContentTitle("Bit Dev")
+                      .setPriority(NotificationCompat.PRIORITY_HIGH)
+                      .setVisibility(NotificationCompat.VISIBILITY_SECRET)
+                      .setSilent(true)
+                      .setOnlyAlertOnce(true)
+                      .setAutoCancel(true)
+                      .setTimeoutAfter(4000L)
+                      .setFullScreenIntent(pending, true)
+                      .build()
+                  runCatching { nm.notify(NOTIFICATION_ID, notification) }
+              }
+
+              fun cancelNotification(context: Context) {
+                  runCatching {
+                      context.getSystemService(NotificationManager::class.java)?.cancel(NOTIFICATION_ID)
+                  }
+              }
+
+              /** Mở trang cấp quyền còn thiếu: "hiển thị trên ứng dụng khác", rồi full-screen intent, rồi thông tin app. */
+              fun openPermissionSettings(context: Context) {
+                  val pkg = context.packageName
+                  val uri = Uri.parse("package:$pkg")
+                  val candidates = ArrayList<Intent>()
+                  if (!Settings.canDrawOverlays(context)) {
+                      candidates += Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, uri)
+                  }
+                  if (Build.VERSION.SDK_INT >= 34) {
+                      val nm = context.getSystemService(NotificationManager::class.java)
+                      if (nm != null && !nm.canUseFullScreenIntent()) {
+                          candidates += Intent(Settings.ACTION_MANAGE_APP_USE_FULL_SCREEN_INTENT, uri)
+                      }
+                  }
+                  candidates += Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, uri)
+                  for (intent in candidates) {
+                      try {
+                          context.startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                          return
+                      } catch (_: Exception) {
+                      }
+                  }
+              }
+          }
+          KT_LAUNCHER_EOF
+          cat > "$D/LockScreenActivity.kt" <<'KT_ACTIVITY_EOF'
+          package com.music.bitchord.lockscreen
+
+          import android.app.KeyguardManager
+          import android.content.BroadcastReceiver
+          import android.content.Context
+          import android.content.Intent
+          import android.content.IntentFilter
+          import android.graphics.Color as AndroidColor
+          import android.hardware.camera2.CameraCharacteristics
+          import android.hardware.camera2.CameraManager
+          import android.media.AudioManager
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.provider.MediaStore
+          import android.text.format.DateFormat
+          import android.view.WindowManager
+          import androidx.activity.ComponentActivity
+          import androidx.activity.SystemBarStyle
+          import androidx.activity.compose.setContent
+          import androidx.activity.enableEdgeToEdge
+          import androidx.compose.animation.Crossfade
+          import androidx.compose.animation.core.LinearEasing
+          import androidx.compose.animation.core.RepeatMode
+          import androidx.compose.animation.core.animateFloat
+          import androidx.compose.animation.core.animateFloatAsState
+          import androidx.compose.animation.core.infiniteRepeatable
+          import androidx.compose.animation.core.rememberInfiniteTransition
+          import androidx.compose.animation.core.tween
+          import androidx.compose.foundation.Canvas
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.border
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+          import androidx.compose.foundation.gestures.detectTapGestures
+          import androidx.compose.foundation.gestures.detectVerticalDragGestures
+          import androidx.compose.foundation.interaction.MutableInteractionSource
+          import androidx.compose.foundation.layout.Arrangement
+          import androidx.compose.foundation.layout.Box
+          import androidx.compose.foundation.layout.Column
+          import androidx.compose.foundation.layout.Row
+          import androidx.compose.foundation.layout.Spacer
+          import androidx.compose.foundation.layout.fillMaxSize
+          import androidx.compose.foundation.layout.fillMaxWidth
+          import androidx.compose.foundation.layout.height
+          import androidx.compose.foundation.layout.navigationBarsPadding
+          import androidx.compose.foundation.layout.padding
+          import androidx.compose.foundation.layout.size
+          import androidx.compose.foundation.layout.statusBarsPadding
+          import androidx.compose.foundation.layout.width
+          import androidx.compose.foundation.shape.CircleShape
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.material3.Icon
+          import androidx.compose.material3.Text
+          import androidx.compose.runtime.Composable
+          import androidx.compose.runtime.DisposableEffect
+          import androidx.compose.runtime.LaunchedEffect
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableFloatStateOf
+          import androidx.compose.runtime.mutableLongStateOf
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.remember
+          import androidx.compose.runtime.rememberUpdatedState
+          import androidx.compose.runtime.setValue
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.geometry.CornerRadius
+          import androidx.compose.ui.geometry.Offset
+          import androidx.compose.ui.geometry.Size
+          import androidx.compose.ui.graphics.Brush
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.graphics.Path
+          import androidx.compose.ui.graphics.StrokeCap
+          import androidx.compose.ui.graphics.StrokeJoin
+          import androidx.compose.ui.graphics.drawscope.Stroke
+          import androidx.compose.ui.graphics.graphicsLayer
+          import androidx.compose.ui.input.pointer.pointerInput
+          import androidx.compose.ui.layout.ContentScale
+          import androidx.compose.ui.layout.onSizeChanged
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.platform.LocalDensity
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.text.style.TextAlign
+          import androidx.compose.ui.text.style.TextOverflow
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import androidx.core.content.ContextCompat
+          import androidx.lifecycle.compose.collectAsStateWithLifecycle
+          import androidx.media3.common.Player
+          import androidx.media3.session.SessionCommand
+          import coil3.compose.AsyncImage
+          import com.music.bitchord.data.canvas.CanvasArtwork
+          import com.music.bitchord.data.canvas.CanvasRepository
+          import com.music.bitchord.data.model.artworkAt
+          import com.music.bitchord.data.settings.AppSettings
+          import com.music.bitchord.playback.ACTION_TOGGLE_FAVORITE
+          import com.music.bitchord.playback.rememberMediaController
+          import com.music.bitchord.playback.rememberPlayerState
+          import com.music.bitchord.ui.icons.SfIcons
+          import com.music.bitchord.ui.player.AndroidCanvasArtworkPlayer
+          import com.music.bitchord.ui.theme.BitChordTheme
+          import com.music.bitchord.widget.MediaWidgetSnapshot
+          import kotlinx.coroutines.delay
+          import java.util.Locale
+          import kotlin.math.roundToInt
+
+          /**
+           * Màn khoá kiểu iOS 26 cho Bit Dev.
+           *
+           * Nền là clip Canvas (Spotify / Apple / Tidal) toàn màn hình, không có thì dùng ảnh bìa phóng to.
+           * Phía trên là giờ + ngày một dòng, phía dưới là thẻ kính mờ (tên bài, nghệ sĩ, thanh tua, ⏮ ⏯ ⏭, âm lượng),
+           * hai nút tròn đèn pin / camera và thanh home. Vuốt lên để mở khoá.
+           */
+          class LockScreenActivity : ComponentActivity() {
+
+              private val torchOn = mutableStateOf(false)
+              private var torchId: String? = null
+              private var cameraManager: CameraManager? = null
+              private val torchCallback = object : CameraManager.TorchCallback() {
+                  override fun onTorchModeChanged(cameraId: String, enabled: Boolean) {
+                      if (cameraId == torchId) torchOn.value = enabled
+                  }
+              }
+
+              private val unlockReceiver = object : BroadcastReceiver() {
+                  override fun onReceive(context: Context, intent: Intent) {
+                      finishAndRemoveTask()
+                  }
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  alive = true
+                  if (Build.VERSION.SDK_INT >= 27) {
+                      setShowWhenLocked(true)
+                  } else {
+                      @Suppress("DEPRECATION")
+                      window.addFlags(WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED)
+                  }
+                  enableEdgeToEdge(
+                      statusBarStyle = SystemBarStyle.dark(AndroidColor.TRANSPARENT),
+                      navigationBarStyle = SystemBarStyle.dark(AndroidColor.TRANSPARENT),
+                  )
+                  LockScreenLauncher.cancelNotification(this)
+
+                  ContextCompat.registerReceiver(
+                      this,
+                      unlockReceiver,
+                      IntentFilter(Intent.ACTION_USER_PRESENT),
+                      ContextCompat.RECEIVER_NOT_EXPORTED,
+                  )
+
+                  cameraManager = getSystemService(CameraManager::class.java)
+                  torchId = runCatching {
+                      cameraManager?.cameraIdList?.firstOrNull { id ->
+                          val c = cameraManager!!.getCameraCharacteristics(id)
+                          c.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true &&
+                              c.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK
+                      }
+                  }.getOrNull()
+                  runCatching { cameraManager?.registerTorchCallback(torchCallback, Handler(Looper.getMainLooper())) }
+
+                  setContent {
+                      val appFont by AppSettings.appFont.collectAsStateWithLifecycle()
+                      BitChordTheme(darkTheme = true, font = appFont) {
+                          LockScreenRoot(
+                              torchAvailable = torchId != null,
+                              torchOn = torchOn.value,
+                              onToggleTorch = ::toggleTorch,
+                              onCamera = ::openCamera,
+                              onUnlock = ::unlock,
+                              onNothingToShow = { finishAndRemoveTask() },
+                          )
+                      }
+                  }
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  // Mở khoá bằng vân tay / khuôn mặt trước khi Activity kịp đăng ký receiver: đừng ở lại đè lên màn hình chính.
+                  val keyguard = getSystemService(KeyguardManager::class.java)
+                  if (keyguard != null && !keyguard.isKeyguardLocked) finishAndRemoveTask()
+              }
+
+              override fun onDestroy() {
+                  alive = false
+                  runCatching { unregisterReceiver(unlockReceiver) }
+                  runCatching { cameraManager?.unregisterTorchCallback(torchCallback) }
+                  super.onDestroy()
+              }
+
+              private fun unlock() {
+                  val keyguard = getSystemService(KeyguardManager::class.java)
+                  if (keyguard == null || !keyguard.isKeyguardLocked) {
+                      finishAndRemoveTask()
+                      return
+                  }
+                  keyguard.requestDismissKeyguard(
+                      this,
+                      object : KeyguardManager.KeyguardDismissCallback() {
+                          override fun onDismissSucceeded() {
+                              finishAndRemoveTask()
+                          }
+                      },
+                  )
+              }
+
+              private fun toggleTorch() {
+                  val id = torchId ?: return
+                  runCatching { cameraManager?.setTorchMode(id, !torchOn.value) }
+              }
+
+              private fun openCamera() {
+                  val secure = Intent(MediaStore.INTENT_ACTION_STILL_IMAGE_CAMERA_SECURE)
+                      .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                  try {
+                      startActivity(secure)
+                  } catch (_: Exception) {
+                      try {
+                          startActivity(
+                              Intent(MediaStore.INTENT_ACTION_STILL_IMAGE_CAMERA)
+                                  .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                          )
+                      } catch (_: Exception) {
+                      }
+                  }
+              }
+
+              companion object {
+                  @Volatile
+                  var alive: Boolean = false
+              }
+          }
+
+          // ---------------------------------------------------------------------------------------------
+          // Giao diện
+          // ---------------------------------------------------------------------------------------------
+
+          @Composable
+          private fun LockScreenRoot(
+              torchAvailable: Boolean,
+              torchOn: Boolean,
+              onToggleTorch: () -> Unit,
+              onCamera: () -> Unit,
+              onUnlock: () -> Unit,
+              onNothingToShow: () -> Unit,
+          ) {
+              val context = LocalContext.current
+              val controller = rememberMediaController()
+              val state = rememberPlayerState(controller)
+              val song = state.song
+
+              // playWhenReady đổi ngay khi bấm, không chờ player thật sự phát (bài YouTube phải resolve vài giây).
+              var playWhenReady by remember { mutableStateOf(false) }
+              DisposableEffect(controller) {
+                  val c = controller ?: return@DisposableEffect onDispose {}
+                  playWhenReady = c.playWhenReady
+                  val listener = object : Player.Listener {
+                      override fun onPlayWhenReadyChanged(ready: Boolean, reason: Int) {
+                          playWhenReady = ready
+                      }
+                  }
+                  c.addListener(listener)
+                  onDispose { c.removeListener(listener) }
+              }
+
+              // Không còn gì để hiện (hàng đợi trống) thì thôi, trả lại màn khoá hệ thống.
+              LaunchedEffect(controller, song) {
+                  val c = controller ?: return@LaunchedEffect
+                  if (song == null) {
+                      delay(2500)
+                      if (c.currentMediaItem == null) onNothingToShow()
+                  }
+              }
+
+              // --- Canvas ---
+              val animated by AppSettings.animatedCanvas.collectAsStateWithLifecycle()
+              val overCellular by AppSettings.canvasOverCellular.collectAsStateWithLifecycle()
+              val metered by AppSettings.meteredConnection.collectAsStateWithLifecycle()
+              val canvasAllowed = animated && (metered != true || overCellular)
+              var canvas by remember(song?.videoId) { mutableStateOf<CanvasArtwork?>(null) }
+              LaunchedEffect(song?.videoId, canvasAllowed) {
+                  canvas = null
+                  val s = song ?: return@LaunchedEffect
+                  if (!canvasAllowed) return@LaunchedEffect
+                  val found = CanvasRepository.cached(s) ?: CanvasRepository.canvasFor(s)
+                  // Bản 3:4 của Apple hợp với màn hình dọc hơn bản vuông.
+                  canvas = found?.let { c ->
+                      val tall = c.portraitUrl
+                      if (tall != null) c.copy(url = tall, fallbackUrl = c.url, portraitUrl = null) else c
+                  }
+              }
+
+              // --- Yêu thích (đọc từ snapshot mà service đã công bố cho widget) ---
+              var liked by remember { mutableStateOf(false) }
+              var canLike by remember { mutableStateOf(false) }
+              var likeTick by remember { mutableStateOf(0) }
+              LaunchedEffect(song?.videoId, likeTick) {
+                  repeat(3) {
+                      runCatching { MediaWidgetSnapshot.load(context) }.getOrNull()?.let {
+                          liked = it.isLiked
+                          canLike = it.canLike
+                      }
+                      delay(600)
+                  }
+              }
+
+              // --- Thanh tua ---
+              var scrub by remember { mutableStateOf<Float?>(null) }
+              val durationMs = state.durationMs.coerceAtLeast(0L)
+              val positionMs = state.position.positionMs.coerceAtLeast(0L)
+              val fraction = scrub ?: if (durationMs > 0) (positionMs.toFloat() / durationMs).coerceIn(0f, 1f) else 0f
+              val shownMs = scrub?.let { (it * durationMs).toLong() } ?: positionMs
+
+              // --- Âm lượng ---
+              val audio = remember { context.getSystemService(AudioManager::class.java) }
+              var volume by remember { mutableFloatStateOf(0f) }
+              var volumeDragging by remember { mutableStateOf(false) }
+              LaunchedEffect(audio) {
+                  while (true) {
+                      if (!volumeDragging && audio != null) {
+                          val max = audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
+                          volume = audio.getStreamVolume(AudioManager.STREAM_MUSIC).toFloat() / max
+                      }
+                      delay(400)
+                  }
+              }
+
+              // --- Vuốt lên để mở khoá ---
+              val density = LocalDensity.current
+              val unlockThresholdPx = with(density) { 140.dp.toPx() }
+              var dragY by remember { mutableFloatStateOf(0f) }
+              val shownDrag by animateFloatAsState(targetValue = dragY, label = "unlockDrag")
+
+              Box(
+                  modifier = Modifier
+                      .fillMaxSize()
+                      .background(Color.Black)
+                      .pointerInput(Unit) {
+                          detectVerticalDragGestures(
+                              onDragEnd = {
+                                  val unlock = dragY < -unlockThresholdPx
+                                  dragY = 0f
+                                  if (unlock) onUnlock()
+                              },
+                              onDragCancel = { dragY = 0f },
+                              onVerticalDrag = { change, amount ->
+                                  dragY = (dragY + amount).coerceAtMost(0f)
+                                  change.consume()
+                              },
+                          )
+                      },
+              ) {
+                  // Nền: ảnh bìa phóng đầy màn hình, clip Canvas đè lên khi đã có khung hình đầu tiên.
+                  Crossfade(targetState = song?.artworkAt(1080) ?: song?.thumbnailUrl, label = "lockArt") { art ->
+                      if (art != null) {
+                          AsyncImage(
+                              model = art,
+                              contentDescription = null,
+                              contentScale = ContentScale.Crop,
+                              modifier = Modifier.fillMaxSize(),
+                          )
+                      }
+                  }
+                  canvas?.let {
+                      AndroidCanvasArtworkPlayer(
+                          canvas = it,
+                          isPlaying = playWhenReady,
+                          modifier = Modifier.fillMaxSize(),
+                          frameCapturePx = 0,
+                      )
+                  }
+                  // Tối nhẹ ở đỉnh và đáy để chữ dễ đọc trên mọi ảnh.
+                  Box(
+                      Modifier
+                          .fillMaxSize()
+                          .background(
+                              Brush.verticalGradient(
+                                  0f to Color.Black.copy(alpha = 0.30f),
+                                  0.28f to Color.Transparent,
+                                  0.50f to Color.Transparent,
+                                  1f to Color.Black.copy(alpha = 0.70f),
+                              ),
+                          ),
+                  )
+
+                  Column(
+                      modifier = Modifier
+                          .fillMaxSize()
+                          .statusBarsPadding()
+                          .navigationBarsPadding()
+                          .graphicsLayer {
+                              translationY = shownDrag
+                              alpha = (1f + shownDrag / (unlockThresholdPx * 2f)).coerceIn(0.25f, 1f)
+                          },
+                      horizontalAlignment = Alignment.CenterHorizontally,
+                  ) {
+                      Spacer(Modifier.height(40.dp))
+                      ClockHeader()
+                      Spacer(Modifier.weight(1f))
+
+                      // ---- Thẻ kính mờ ----
+                      val cardShape = RoundedCornerShape(30.dp)
+                      Column(
+                          modifier = Modifier
+                              .fillMaxWidth()
+                              .padding(horizontal = 14.dp)
+                              .clip(cardShape)
+                              .background(
+                                  Brush.verticalGradient(
+                                      listOf(Color.White.copy(alpha = 0.20f), Color.White.copy(alpha = 0.11f)),
+                                  ),
+                              )
+                              .border(
+                                  1.dp,
+                                  Brush.verticalGradient(
+                                      listOf(Color.White.copy(alpha = 0.45f), Color.White.copy(alpha = 0.08f)),
+                                  ),
+                                  cardShape,
+                              )
+                              .padding(horizontal = 20.dp, vertical = 16.dp),
+                      ) {
+                          Box(Modifier.fillMaxWidth()) {
+                              Column(
+                                  modifier = Modifier
+                                      .align(Alignment.Center)
+                                      .padding(horizontal = 30.dp),
+                                  horizontalAlignment = Alignment.CenterHorizontally,
+                              ) {
+                                  Text(
+                                      text = song?.title.orEmpty(),
+                                      color = Color.White,
+                                      fontSize = 17.sp,
+                                      fontWeight = FontWeight.SemiBold,
+                                      maxLines = 1,
+                                      overflow = TextOverflow.Ellipsis,
+                                      textAlign = TextAlign.Center,
+                                  )
+                                  Text(
+                                      text = song?.artist.orEmpty(),
+                                      color = Color.White.copy(alpha = 0.68f),
+                                      fontSize = 16.sp,
+                                      maxLines = 1,
+                                      overflow = TextOverflow.Ellipsis,
+                                      textAlign = TextAlign.Center,
+                                  )
+                              }
+                              WaveformIcon(
+                                  playing = playWhenReady,
+                                  modifier = Modifier.align(Alignment.TopEnd),
+                              )
+                          }
+                          Spacer(Modifier.height(10.dp))
+                          GlassSlider(
+                              fraction = fraction,
+                              enabled = durationMs > 0,
+                              onChange = { scrub = it },
+                              onChangeFinished = { f ->
+                                  controller?.seekTo((f * durationMs).toLong())
+                                  scrub = null
+                              },
+                          )
+                          Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                              Text(formatTime(shownMs), color = Color.White.copy(alpha = 0.6f), fontSize = 13.sp)
+                              Text(
+                                  "-" + formatTime((durationMs - shownMs).coerceAtLeast(0L)),
+                                  color = Color.White.copy(alpha = 0.6f),
+                                  fontSize = 13.sp,
+                              )
+                          }
+                          Spacer(Modifier.height(6.dp))
+                          Row(
+                              modifier = Modifier.fillMaxWidth(),
+                              verticalAlignment = Alignment.CenterVertically,
+                              horizontalArrangement = Arrangement.SpaceBetween,
+                          ) {
+                              PlainButton(
+                                  size = 44.dp,
+                                  onClick = {
+                                      if (canLike && controller != null) {
+                                          liked = !liked
+                                          controller.sendCustomCommand(
+                                              SessionCommand(ACTION_TOGGLE_FAVORITE, Bundle.EMPTY),
+                                              Bundle.EMPTY,
+                                          )
+                                          likeTick++
+                                      }
+                                  },
+                              ) {
+                                  Icon(
+                                      imageVector = if (liked) SfIcons.StarFill else SfIcons.Star,
+                                      contentDescription = null,
+                                      tint = Color.White.copy(alpha = if (canLike) 0.85f else 0.35f),
+                                      modifier = Modifier.size(26.dp),
+                                  )
+                              }
+                              PlainButton(
+                                  size = 56.dp,
+                                  onClick = {
+                                      controller?.let {
+                                          it.seekToPreviousMediaItem()
+                                          if (it.playbackState == Player.STATE_IDLE) it.prepare()
+                                      }
+                                  },
+                              ) { TransportGlyph(Glyph.PREV, Modifier.size(width = 38.dp, height = 26.dp)) }
+                              PlainButton(
+                                  size = 64.dp,
+                                  onClick = {
+                                      controller?.let {
+                                          if (it.playWhenReady) {
+                                              it.pause()
+                                          } else {
+                                              if (it.playbackState == Player.STATE_IDLE) it.prepare()
+                                              it.play()
+                                          }
+                                      }
+                                  },
+                              ) {
+                                  TransportGlyph(
+                                      if (playWhenReady) Glyph.PAUSE else Glyph.PLAY,
+                                      Modifier.size(width = 34.dp, height = 36.dp),
+                                  )
+                              }
+                              PlainButton(
+                                  size = 56.dp,
+                                  onClick = {
+                                      controller?.let {
+                                          it.seekToNextMediaItem()
+                                          if (it.playbackState == Player.STATE_IDLE) it.prepare()
+                                      }
+                                  },
+                              ) { TransportGlyph(Glyph.NEXT, Modifier.size(width = 38.dp, height = 26.dp)) }
+                              Box(Modifier.size(44.dp), contentAlignment = Alignment.Center) {
+                                  SpeakerGlyph(
+                                      waves = 2,
+                                      modifier = Modifier.size(26.dp),
+                                      tint = Color.White.copy(alpha = 0.55f),
+                                  )
+                              }
+                          }
+                          Spacer(Modifier.height(10.dp))
+                          Row(verticalAlignment = Alignment.CenterVertically) {
+                              SpeakerGlyph(0, Modifier.size(16.dp), Color.White.copy(alpha = 0.6f))
+                              Spacer(Modifier.width(10.dp))
+                              GlassSlider(
+                                  fraction = volume,
+                                  modifier = Modifier.weight(1f),
+                                  onChange = { f ->
+                                      volumeDragging = true
+                                      volume = f
+                                      if (audio != null) {
+                                          val max = audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+                                          runCatching {
+                                              audio.setStreamVolume(
+                                                  AudioManager.STREAM_MUSIC,
+                                                  (f * max).roundToInt().coerceIn(0, max),
+                                                  0,
+                                              )
+                                          }
+                                      }
+                                  },
+                                  onChangeFinished = { volumeDragging = false },
+                              )
+                              Spacer(Modifier.width(10.dp))
+                              SpeakerGlyph(2, Modifier.size(20.dp), Color.White.copy(alpha = 0.6f))
+                          }
+                      }
+
+                      Spacer(Modifier.height(26.dp))
+                      Row(
+                          modifier = Modifier
+                              .fillMaxWidth()
+                              .padding(horizontal = 44.dp),
+                          horizontalArrangement = Arrangement.SpaceBetween,
+                      ) {
+                          if (torchAvailable) {
+                              RoundButton(active = torchOn, onClick = onToggleTorch) {
+                                  FlashlightGlyph(Modifier.size(24.dp), if (torchOn) Color.Black.copy(alpha = 0.85f) else Color.White)
+                              }
+                          } else {
+                              Spacer(Modifier.size(52.dp))
+                          }
+                          RoundButton(active = false, onClick = onCamera) {
+                              CameraGlyph(Modifier.size(26.dp), Color.White)
+                          }
+                      }
+                      Spacer(Modifier.height(18.dp))
+                      Box(
+                          Modifier
+                              .width(134.dp)
+                              .height(5.dp)
+                              .clip(CircleShape)
+                              .background(Color.White.copy(alpha = 0.9f)),
+                      )
+                      Spacer(Modifier.height(8.dp))
+                  }
+              }
+          }
+
+          @Composable
+          private fun ClockHeader() {
+              val context = LocalContext.current
+              var now by remember { mutableLongStateOf(System.currentTimeMillis()) }
+              LaunchedEffect(Unit) {
+                  while (true) {
+                      now = System.currentTimeMillis()
+                      delay(1000)
+                  }
+              }
+              val locale = Locale.getDefault()
+              val is24 = DateFormat.is24HourFormat(context)
+              val minute = now / 60_000L
+              val time = remember(minute, is24) {
+                  java.text.SimpleDateFormat(
+                      DateFormat.getBestDateTimePattern(locale, if (is24) "Hm" else "hm"),
+                      locale,
+                  ).format(java.util.Date(now))
+              }
+              val date = remember(now / 3_600_000L) {
+                  java.text.SimpleDateFormat(
+                      DateFormat.getBestDateTimePattern(locale, "EEEdMMM"),
+                      locale,
+                  ).format(java.util.Date(now))
+              }
+              Row(verticalAlignment = Alignment.CenterVertically) {
+                  Text(time, color = Color.White, fontSize = 26.sp, fontWeight = FontWeight.Bold)
+                  Spacer(Modifier.width(18.dp))
+                  Text(date, color = Color.White.copy(alpha = 0.92f), fontSize = 26.sp, fontWeight = FontWeight.SemiBold)
+              }
+          }
+
+          private fun formatTime(ms: Long): String {
+              val total = (ms / 1000L).coerceAtLeast(0L)
+              return String.format(Locale.US, "%d:%02d", total / 60, total % 60)
+          }
+
+          @Composable
+          private fun PlainButton(size: androidx.compose.ui.unit.Dp, onClick: () -> Unit, content: @Composable () -> Unit) {
+              Box(
+                  modifier = Modifier
+                      .size(size)
+                      .clickable(
+                          interactionSource = remember { MutableInteractionSource() },
+                          indication = null,
+                          onClick = onClick,
+                      ),
+                  contentAlignment = Alignment.Center,
+              ) { content() }
+          }
+
+          @Composable
+          private fun RoundButton(active: Boolean, onClick: () -> Unit, content: @Composable () -> Unit) {
+              Box(
+                  modifier = Modifier
+                      .size(52.dp)
+                      .clip(CircleShape)
+                      .background(if (active) Color.White.copy(alpha = 0.92f) else Color.White.copy(alpha = 0.16f))
+                      .border(1.dp, Color.White.copy(alpha = 0.18f), CircleShape)
+                      .clickable(
+                          interactionSource = remember { MutableInteractionSource() },
+                          indication = null,
+                          onClick = onClick,
+                      ),
+                  contentAlignment = Alignment.Center,
+              ) { content() }
+          }
+
+          /** Thanh trượt mảnh kiểu iOS: kéo hoặc chạm để chọn vị trí. */
+          @Composable
+          private fun GlassSlider(
+              fraction: Float,
+              onChange: (Float) -> Unit,
+              onChangeFinished: (Float) -> Unit,
+              modifier: Modifier = Modifier,
+              enabled: Boolean = true,
+          ) {
+              var widthPx by remember { mutableFloatStateOf(1f) }
+              val change by rememberUpdatedState(onChange)
+              val finished by rememberUpdatedState(onChangeFinished)
+              Box(
+                  modifier = modifier
+                      .fillMaxWidth()
+                      .height(28.dp)
+                      .onSizeChanged { widthPx = it.width.toFloat().coerceAtLeast(1f) }
+                      .pointerInput(enabled) {
+                          if (!enabled) return@pointerInput
+                          detectTapGestures { offset ->
+                              val f = (offset.x / widthPx).coerceIn(0f, 1f)
+                              change(f)
+                              finished(f)
+                          }
+                      }
+                      .pointerInput(enabled) {
+                          if (!enabled) return@pointerInput
+                          var last = 0f
+                          detectHorizontalDragGestures(
+                              onDragStart = { o ->
+                                  last = (o.x / widthPx).coerceIn(0f, 1f)
+                                  change(last)
+                              },
+                              onDragEnd = { finished(last) },
+                              onDragCancel = { finished(last) },
+                              onHorizontalDrag = { c, _ ->
+                                  last = (c.position.x / widthPx).coerceIn(0f, 1f)
+                                  change(last)
+                                  c.consume()
+                              },
+                          )
+                      },
+                  contentAlignment = Alignment.CenterStart,
+              ) {
+                  Box(
+                      Modifier
+                          .fillMaxWidth()
+                          .height(6.dp)
+                          .clip(CircleShape)
+                          .background(Color.White.copy(alpha = 0.28f)),
+                  )
+                  Box(
+                      Modifier
+                          .fillMaxWidth(fraction.coerceIn(0f, 1f))
+                          .height(6.dp)
+                          .clip(CircleShape)
+                          .background(Color.White.copy(alpha = 0.88f)),
+                  )
+              }
+          }
+
+          @Composable
+          private fun WaveformIcon(playing: Boolean, modifier: Modifier = Modifier) {
+              val transition = rememberInfiniteTransition(label = "wave")
+              val a by transition.animateFloat(
+                  initialValue = 0.30f, targetValue = 1f,
+                  animationSpec = infiniteRepeatable(tween(520, easing = LinearEasing), RepeatMode.Reverse), label = "a",
+              )
+              val b by transition.animateFloat(
+                  initialValue = 0.45f, targetValue = 1f,
+                  animationSpec = infiniteRepeatable(tween(410, easing = LinearEasing), RepeatMode.Reverse), label = "b",
+              )
+              val c by transition.animateFloat(
+                  initialValue = 0.25f, targetValue = 0.95f,
+                  animationSpec = infiniteRepeatable(tween(680, easing = LinearEasing), RepeatMode.Reverse), label = "c",
+              )
+              val d by transition.animateFloat(
+                  initialValue = 0.40f, targetValue = 1f,
+                  animationSpec = infiniteRepeatable(tween(470, easing = LinearEasing), RepeatMode.Reverse), label = "d",
+              )
+              val heights = if (playing) listOf(a, b, c, d, a * 0.8f) else listOf(0.3f, 0.5f, 0.8f, 0.5f, 0.3f)
+              Canvas(modifier.size(width = 26.dp, height = 22.dp)) {
+                  val n = heights.size
+                  val barW = size.width / (n * 2f - 1f)
+                  heights.forEachIndexed { i, h ->
+                      val bh = size.height * h
+                      drawRoundRect(
+                          color = Color.White.copy(alpha = 0.55f),
+                          topLeft = Offset(i * 2f * barW, (size.height - bh) / 2f),
+                          size = Size(barW, bh),
+                          cornerRadius = CornerRadius(barW / 2f, barW / 2f),
+                      )
+                  }
+              }
+          }
+
+          private enum class Glyph { PLAY, PAUSE, PREV, NEXT }
+
+          @Composable
+          private fun TransportGlyph(glyph: Glyph, modifier: Modifier = Modifier, tint: Color = Color.White) {
+              Canvas(modifier) {
+                  val w = size.width
+                  val h = size.height
+                  val round = Stroke(width = w * 0.07f, join = StrokeJoin.Round, cap = StrokeCap.Round)
+                  fun triangle(x0: Float, x1: Float, pointsRight: Boolean): Path = Path().apply {
+                      if (pointsRight) {
+                          moveTo(x0, 0.08f * h); lineTo(x1, 0.5f * h); lineTo(x0, 0.92f * h)
+                      } else {
+                          moveTo(x1, 0.08f * h); lineTo(x0, 0.5f * h); lineTo(x1, 0.92f * h)
+                      }
+                      close()
+                  }
+                  fun filled(p: Path) {
+                      drawPath(p, tint)
+                      drawPath(p, tint, style = round)
+                  }
+                  when (glyph) {
+                      Glyph.PLAY -> filled(triangle(0.22f * w, 0.92f * w, true))
+                      Glyph.PAUSE -> {
+                          val bw = 0.27f * w
+                          val r = CornerRadius(0.09f * w, 0.09f * w)
+                          drawRoundRect(tint, Offset(0.10f * w, 0.04f * h), Size(bw, 0.92f * h), r)
+                          drawRoundRect(tint, Offset(0.63f * w, 0.04f * h), Size(bw, 0.92f * h), r)
+                      }
+                      Glyph.PREV -> {
+                          filled(triangle(0.03f * w, 0.50f * w, false))
+                          filled(triangle(0.50f * w, 0.97f * w, false))
+                      }
+                      Glyph.NEXT -> {
+                          filled(triangle(0.03f * w, 0.50f * w, true))
+                          filled(triangle(0.50f * w, 0.97f * w, true))
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          private fun SpeakerGlyph(waves: Int, modifier: Modifier, tint: Color) {
+              Canvas(modifier) {
+                  val w = size.width
+                  val h = size.height
+                  val body = Path().apply {
+                      moveTo(0.05f * w, 0.38f * h)
+                      lineTo(0.28f * w, 0.38f * h)
+                      lineTo(0.50f * w, 0.18f * h)
+                      lineTo(0.50f * w, 0.82f * h)
+                      lineTo(0.28f * w, 0.62f * h)
+                      lineTo(0.05f * w, 0.62f * h)
+                      close()
+                  }
+                  drawPath(body, tint)
+                  for (i in 1..waves) {
+                      val r = (0.16f + 0.13f * i) * w
+                      drawArc(
+                          color = tint,
+                          startAngle = -45f,
+                          sweepAngle = 90f,
+                          useCenter = false,
+                          topLeft = Offset(0.5f * w - r, 0.5f * h - r),
+                          size = Size(2f * r, 2f * r),
+                          style = Stroke(width = w * 0.09f, cap = StrokeCap.Round),
+                      )
+                  }
+              }
+          }
+
+          @Composable
+          private fun FlashlightGlyph(modifier: Modifier, tint: Color) {
+              Canvas(modifier) {
+                  val w = size.width
+                  val h = size.height
+                  drawRoundRect(tint, Offset(0.26f * w, 0.04f * h), Size(0.48f * w, 0.24f * h), CornerRadius(0.06f * w, 0.06f * w))
+                  drawRoundRect(tint, Offset(0.34f * w, 0.28f * h), Size(0.32f * w, 0.66f * h), CornerRadius(0.08f * w, 0.08f * w))
+                  drawRoundRect(
+                      Color.Black.copy(alpha = 0.35f),
+                      Offset(0.46f * w, 0.42f * h),
+                      Size(0.08f * w, 0.18f * h),
+                      CornerRadius(0.04f * w, 0.04f * w),
+                  )
+              }
+          }
+
+          @Composable
+          private fun CameraGlyph(modifier: Modifier, tint: Color) {
+              Canvas(modifier) {
+                  val w = size.width
+                  val h = size.height
+                  drawRoundRect(tint, Offset(0.30f * w, 0.14f * h), Size(0.28f * w, 0.16f * h), CornerRadius(0.05f * w, 0.05f * w))
+                  drawRoundRect(tint, Offset(0.06f * w, 0.24f * h), Size(0.88f * w, 0.62f * h), CornerRadius(0.14f * w, 0.14f * w))
+                  drawCircle(Color.Black.copy(alpha = 0.55f), radius = 0.19f * w, center = Offset(0.5f * w, 0.55f * h))
+                  drawCircle(tint, radius = 0.12f * w, center = Offset(0.5f * w, 0.55f * h))
+              }
+          }
+          KT_ACTIVITY_EOF
+          cat > app/src/main/res/values/lock_screen_strings.xml <<'LS_STRINGS_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="lock_screen_player" translatable="false">Màn khoá kiểu iOS 26</string>
+              <string name="lock_screen_player_subtitle" translatable="false">Khoá máy lúc đang phát nhạc: nền Canvas hoặc ảnh bìa toàn màn hình, thẻ điều khiển kính mờ, vuốt lên để mở khoá</string>
+              <string name="lock_screen_player_permission" translatable="false">Cấp quyền hiện trên màn khoá</string>
+              <string name="lock_screen_player_permission_subtitle" translatable="false">Nếu màn khoá mới không hiện: bật Hiển thị trên ứng dụng khác, và quyền hiện trên màn hình khoá của hãng máy</string>
+          </resources>
+          LS_STRINGS_EOF
+          cat > "$RUNNER_TEMP/patch_ios26.py" <<'IOS26_PY_EOF'
+          import re, sys
+
+          def read(p):
+              return open(p, encoding="utf8").read()
+
+          def write(p, s):
+              open(p, "w", encoding="utf8").write(s)
+
+          def fail(msg):
+              sys.exit(f"::error::{msg}")
+
+          # ---------------------------------------------------------------- AndroidManifest.xml (bắt buộc)
+          MF = "app/src/main/AndroidManifest.xml"
+          s = read(MF)
+          if "LockScreenActivity" in s:
+              print("Manifest đã có LockScreenActivity, bỏ qua.")
+          else:
+              perm_anchor = '<uses-permission android:name="android.permission.POST_NOTIFICATIONS" />'
+              if s.count(perm_anchor) != 1:
+                  fail("Không tìm được dòng POST_NOTIFICATIONS trong AndroidManifest.xml để thêm quyền màn khoá.")
+              extra_perms = (
+                  perm_anchor
+                  + '\n    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />'
+                  + '\n    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />'
+              )
+              s = s.replace(perm_anchor, extra_perms)
+              if s.count("</application>") != 1:
+                  fail("AndroidManifest.xml không có đúng một thẻ </application>.")
+              activity = '''
+                  <!-- Màn khoá kiểu iOS 26: hiện đè lên màn khoá hệ thống khi đang phát nhạc. -->
+                  <activity
+                      android:name=".lockscreen.LockScreenActivity"
+                      android:exported="false"
+                      android:excludeFromRecents="true"
+                      android:launchMode="singleInstance"
+                      android:taskAffinity=""
+                      android:showWhenLocked="true"
+                      android:screenOrientation="portrait"
+                      android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode"
+                      android:theme="@style/Theme.BitChord" />
+          '''
+              s = s.replace("</application>", activity + "    </application>")
+              write(MF, s)
+              print("Đã thêm LockScreenActivity + quyền vào AndroidManifest.xml")
+
+          # ---------------------------------------------------------------- BitChordApplication.kt (bắt buộc)
+          APP = "app/src/main/java/com/music/bitchord/BitChordApplication.kt"
+          s = read(APP)
+          if "LockScreenLauncher" in s:
+              print("Application đã gọi LockScreenLauncher, bỏ qua.")
+          else:
+              anchor = "    override fun onCreate() {\n        super.onCreate()\n"
+              if s.count(anchor) != 1:
+                  fail("Không vá được BitChordApplication.onCreate (tìm thấy %d chỗ khớp, cần đúng 1)." % s.count(anchor))
+              s = s.replace(anchor, anchor + "        com.music.bitchord.lockscreen.LockScreenLauncher.init(this)\n")
+              write(APP, s)
+              print("Đã gọi LockScreenLauncher.init trong BitChordApplication.onCreate")
+
+          # ---------------------------------------------------------------- SettingsSheet.kt (không bắt buộc: lỗi thì chỉ cảnh báo, màn khoá vẫn bật mặc định)
+          SS = "app/src/main/java/com/music/bitchord/ui/screens/SettingsSheet.kt"
+          try:
+              s = read(SS)
+              if "lock_screen_player" in s:
+                  print("SettingsSheet đã có công tắc màn khoá, bỏ qua.")
+              else:
+                  a1 = "    val animatedCanvas by AppSettings.animatedCanvas.collectAsStateWithLifecycle()\n"
+                  a2 = "            val animatedCoverArtTitle = stringResource(R.string.animated_cover_art)\n"
+                  if s.count(a1) != 1 or s.count(a2) != 1:
+                      raise RuntimeError("không thấy chỗ gắn (a1=%d, a2=%d)" % (s.count(a1), s.count(a2)))
+                  s = s.replace(
+                      a1,
+                      a1 + "    val lockScreenPlayer by com.music.bitchord.lockscreen.LockScreenSettings.enabled.collectAsStateWithLifecycle()\n",
+                  )
+                  rows = '''            val lockScreenContext = androidx.compose.ui.platform.LocalContext.current
+                      val lockScreenTitle = stringResource(R.string.lock_screen_player)
+                      row(lockScreenTitle, "lock", "screen", "khoá", "màn khoá", "ios", "canvas") {
+                          SettingsRow(
+                              icon = SfIcons.Lock,
+                              title = lockScreenTitle,
+                              subtitle = stringResource(R.string.lock_screen_player_subtitle),
+                              trailing = {
+                                  IosSwitch(
+                                      checked = lockScreenPlayer,
+                                      onCheckedChange = { com.music.bitchord.lockscreen.LockScreenSettings.set(lockScreenContext, it) },
+                                  )
+                              },
+                              onClick = {
+                                  com.music.bitchord.lockscreen.LockScreenSettings.set(lockScreenContext, !lockScreenPlayer)
+                              },
+                          )
+                      }
+                      if (lockScreenPlayer) {
+                          val lockScreenPermTitle = stringResource(R.string.lock_screen_player_permission)
+                          row(lockScreenPermTitle, "permission", "overlay", "quyền", divided = false) {
+                              SettingsRow(
+                                  icon = SfIcons.Lock,
+                                  title = lockScreenPermTitle,
+                                  subtitle = stringResource(R.string.lock_screen_player_permission_subtitle),
+                                  trailing = { Chevron() },
+                                  onClick = {
+                                      com.music.bitchord.lockscreen.LockScreenLauncher.openPermissionSettings(lockScreenContext)
+                                  },
+                              )
+                          }
+                      }
+          '''
+                  s = s.replace(a2, rows + a2)
+                  write(SS, s)
+                  print("Đã thêm công tắc 'Màn khoá kiểu iOS 26' vào Cài đặt")
+          except Exception as e:
+              print(f"::warning::Không gắn được công tắc vào Cài đặt ({e}). Màn khoá vẫn hoạt động, mặc định BẬT.")
+          IOS26_PY_EOF
+          python3 "$RUNNER_TEMP/patch_ios26.py"
+          {
+            echo
+            echo "### Màn khoá kiểu iOS 26"
+            echo "- Nền: clip Canvas (Spotify / Apple / Tidal) toàn màn hình, không có thì ảnh bìa phóng đầy màn hình"
+            echo "- Giờ + ngày một dòng ở trên, thẻ kính mờ (tên bài, nghệ sĩ, thanh tua, trước / phát-dừng / sau, sao yêu thích, âm lượng)"
+            echo "- Nút tròn đèn pin + camera, thanh home, vuốt lên để mở khoá (hỏi PIN / vân tay như thường)"
+            echo "- Tự hiện khi bật màn hình lúc máy đang khoá và Bit Dev đang phát nhạc. Bật / tắt: Cài đặt, Màn khoá kiểu iOS 26"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Pick a build number newer than every existing release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Cùng cách tính với workflow "Bit Dev APK": số lớn nhất trong MỌI tag dạng x.y.z.N của repo + 1 (không dùng run_number
+          # trần vì mỗi workflow đếm riêng), để versionCode luôn cao hơn bản đang cài, nếu không Android từ chối cài đè (coi là hạ
+          # phiên bản). Lỗi gọi API thì dừng hẳn (không đoán số) để khỏi đăng nhầm một bản thấp hơn.
+          TAGS="$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" --paginate --jq '.[].tag_name')"
+          MAX=0
+          while IFS= read -r T; do
+            if [[ "$T" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+\.([0-9]+)$ ]]; then
+              X=$(( 10#${BASH_REMATCH[1]} ))
+              if (( X > MAX )); then MAX=$X; fi
+            fi
+          done <<< "$TAGS"
+          N=$(( MAX + 1 ))
+          if (( N < GITHUB_RUN_NUMBER )); then N=$GITHUB_RUN_NUMBER; fi
+          echo "BUILD_N=$N" >> "$GITHUB_ENV"
+          echo "Số bản dựng: $N (số lớn nhất trong các tag trước đó: $MAX)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Patch (rename, version, updater)
+        env:
+          RUN: ${{ env.BUILD_N }}
+        run: |
+          sed -i "s/com\.dev\.bitchord/${APP_PKG}/g; s/BitChord Dev/Bit Dev/g" \
+            app/build.gradle.kts app/src/dev/AndroidManifest.xml wearos/build.gradle.kts tv/build.gradle.kts
+          sed -i '/UPDATE_APK_PREFIX/s/BitChord-/Bit-/' app/build.gradle.kts
+          sed -i 's#repos/[A-Za-z0-9_-]*/[A-Za-z0-9_-]*/releases/latest#repos/${{ github.repository }}/releases/latest#' \
+            app/src/main/java/com/music/bitchord/data/AppUpdateChecker.kt
+          python3 - <<'PY'
+          import os, re
+          run = int(os.environ["RUN"])
+          s = open("build.gradle.kts").read()
+          m = re.search(r'(?:bitchordVersionName"\] = |baseVersion = )"([0-9.]+)"', s)
+          ver = f"{m.group(1)}.{run}"
+          code = max(39 + run, int(os.environ.get("MIN_CODE", "0") or 0))
+          s = re.sub(r'extra\["bitchordVersionCode"\][^\n]*', f'extra["bitchordVersionCode"] = {code}', s)
+          s = re.sub(r'extra\["bitchordVersionName"\] = [^\n]*(\n    if [^\n]*)?',
+                     f'extra["bitchordVersionName"] = "{ver}"', s)
+          open("build.gradle.kts", "w").write(s)
+          open(os.environ["GITHUB_ENV"], "a").write(f"VER={ver}\n")
+          PY
+
+      # Neu repo co secret thi dung secret, khong thi dung key dev nhung san ben duoi.
+
+      - name: Setup Secrets (Keystore & local.properties)
+        env:
+          S_LASTFM_KEY: ${{ secrets.LASTFM_API_KEY }}
+          S_LASTFM_SECRET: ${{ secrets.LASTFM_SECRET }}
+          S_LISTEN: ${{ secrets.LISTEN_TOGETHER_SERVER }}
+          S_KS_B64: ${{ secrets.KEYSTORE_BASE64 }}
+          S_KS_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+          S_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          S_KEY_PASS: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          {
+            echo "LASTFM_API_KEY=$S_LASTFM_KEY"
+            echo "LASTFM_SECRET=$S_LASTFM_SECRET"
+            echo "LISTEN_TOGETHER_SERVER=$S_LISTEN"
+          } > local.properties
+          KS_B64="$S_KS_B64"; KS_PASS="$S_KS_PASS"; KEY_ALIAS="$S_KEY_ALIAS"; KEY_PASS="$S_KEY_PASS"
+          if [ -z "$KS_B64" ]; then
+            KS_B64='MIIKNAIBAzCCCd4GCSqGSIb3DQEHAaCCCc8EggnLMIIJxzCCBa4GCSqGSIb3DQEHAaCCBZ8EggWbMIIFlzCCBZMGCyqGSIb3DQEMCgECoIIFQDCCBTwwZgYJKoZIhvcNAQUNMFkwOAYJKoZIhvcNAQUMMCsEFK0fxII8tlxuTGjlPy9OEoOb4zh1AgInEAIBIDAMBggqhkiG9w0CCQUAMB0GCWCGSAFlAwQBKgQQhoPbS2/EH0Iq39/VLBv1jwSCBNAs4rqRA9jwqLChGhVDGNkL8Z49X1qbtTFdYUjeNjsUWKw+0mtXbsRP9lW04ub3pGi0EJYqvppU1/oywxqpsDluz+QQzIBMvhUS3uWEr5CtNGR5Mr+xVRhnU8FkZ+nXGs8+4ifof2PK9B+14LI3V0Z8HUiWz/+iMkvT596xjj9mjtxtSv92s0vTNpZluQMKKqx5Q4Au37uNNHW3Igae9vEU0Ytfh43zD4sVAFuGsg6u4ULtb8zjXhu5UuIV+UljDKnKWZcVmiwGAQ887QMlJGOJDZi7pSP5MOpaT4pYzMCAa23XISYXq2/n7tZMMNKLfXKQOjm9PVTzwQ7ijPgoiLmYGXRz2Vyzvm+rVCvTvLQVTnprxCxVvy4fNGz4lapcrcYIwTiPaGiG+HeVuWNXprZDP9DwRE+quQYIl6V/7bJAQopebKjXttqh3yIUe9U8L5McJ7jZ3D2DxTRntMIOP8heC8ZqT7dZyuP+2Sl9BY74BSQEz5k+h/tfv3a7Mbjcb53isQrgEsrwP7hlf5yNP1RiX+Tug7wbzCD0oqLU+oThGz9ilAjOL1CowWiyYOUur4ZFt+MQn9Ib7E1727fsmM3q1G4k0k5Iie5UNWcINNB1e9b9OIAJzevgVusUdsgYkO06VTN3mGqZOq9d7Qq9HTz/BCnjgJFRu3fmyzHQyiCMN8qH+6C99ePek39L7GJKqYnXZhxWNhO4C7xFEJvy/OyKOzcJFd9e3ZYkg1ChlPoCXkS3G0PeCFZ+s6yr6RxztS0S5QCXjpyYWeJAwE43lmZ8tNaOpfNxqzYrXmtiC5NCPh/wp+GBh80PsfLbO0b4KizbW5QZQJQoKZTu6hBjamF/9GqjTsMuj4gNF1X4cw9WV6K89z+dGoYx8h6whGZMbGJ57txuAo+eG+DiNgBzo6pwoZNNABwc5veksEbuTnAxuG3wuv+91Bb6lHxar+be493NsO6bxBHoFV1yGI44PPvDgGSEUyv36br1axP/ZKlVal6hgsbSHDyzhaoK3NvRdGHB5/GZonXT8zG3PB2vtDb2I/fPd13w/uW22qEoxV/mNC6I1GePYCp85o/47ETv5feQHaEUONAjLvrohooBGLZk0Ovxw4UyQIQuei+i+HjNqugi5BXzUGCd0DnQ/9sUg2ds+ZrsRtoNAQF2ogik/mpaSdft/3Zd1utl2wt6ThchJ4b1ayrmx8H/QNJ7yYG9jvioY0YF9KuN+69wP1Ailq7hrGzglncaN4BbwAgoX2mrfqclY94jcjn6NWtD33Y0XHlWA5WJtkQF4j1hAlVtWKNjm2/ZUjrGIW3luWtBiycO2xxiwj6nEhVCjgbQ3U9rmp8/XYp+hnJOm/4qAMiHKKRToDr2toaRFz5UjyYg0UIp0cNXnD1mP2S2kRAhFBQZXQPRSWdKPURX8C4EfRb/K1m8OiNxO9brvSKzJV6il9+BOoeqCrUHTvRvxcj28ROSKAnv+spaon+t3diyg48zrOmvayC7VJ3Ypn5G7y0Dxi5L8fjuYA/yl4ql3WaEJyoG7GQtu/liq1vrPlR8YCsxhzvtbksoSWogT8LrNI/LW5IsNQwlBgm1Hx8/+Kfn+FpVRCLiPIg3EyocX+QljpbWY9rKQVImf90heiG9ac+feerUqTFAMBsGCSqGSIb3DQEJFDEOHgwAYgBpAHQAZABlAHYwIQYJKoZIhvcNAQkVMRQEElRpbWUgMTc5NDA0OTUzOTY4MTCCBBEGCSqGSIb3DQEHBqCCBAIwggP+AgEAMIID9wYJKoZIhvcNAQcBMGYGCSqGSIb3DQEFDTBZMDgGCSqGSIb3DQEFDDArBBRmjjcNhxpHIeR4BNN+17LtuxnKVgICJxACASAwDAYIKoZIhvcNAgkFADAdBglghkgBZQMEASoEEGbLAv6ZH20ohfUWYPBGBuSAggOAxkBCVVa9dFi6GL/io3Jc4snGmi65ca5wivyubHYCcmQfKKcFW0mV1G/W/WvS9rHqfqSscHe5W5Yzdu+pH2X4A1sGpEi5KVKJLg7BTCTCKu4rbMg5xBHMVu2akp81Y9PrBZ7VYPfahrkQ2dW+JNo6mqCu2RN6H1M5cjODPQL37e/+xlbs9dDPx81t3ImnLc0NhH4qCu882ws/dgUnWVgmtFE/V0iThHebjgNsP5/g/81tm/Vn+Ddu1OOk/xLC37G4s/SrM8b98bIsq3N5IMIHrgppgFLdO2S/1+kFuN6mY3ksS3s9CEbDNiOR/YkzKIMqC7EF1jN+cIE3N8yjUxvY8AN3WBn4j/FSMhE2hv/QoM1v5v5Q6W6IWt0wEw6MqpWuAYHqPbxHRycl109mDeoZbamE6kAKXk6hZJHmS78CFA0gnQjxR1gnGLr6iJ2opxcUbtsEgURGENH6wfuFHZPMEnTBC6dRiimBEsV+Cnfcj0ep+PG7fWlbUz3XXjEtPsna3BsLvPLRwLVGWdJjTOINyHIT40ut0IS+iBa6hzFesQrDUvRoF+N4wvf9aiWfxoetLhLUI/+sBQb0UAtYpaqUN8tJrMn5gPTjCB/ve1kEK6LNHhbemi25OdC9wnP6ak/R+ZofPPBqVrRUMX1XN1Verqg130AZGKAs2cM+hkmmzqzy7gZmh2Hrq4v6S8O5eB+eXHFqjPJ+OKj7zzPYm4Ao+9pnokFnfdvDzWlGl2mV8WHoeafZ7EaYeYW/KGuQGO5N3BFTOYBPlCbSnyF4iQyzv3Kjl9IdHCh/h3kuNs/LiV2pCaBKq8yjONt8K2QrtMW021Uz8C7MpXsprfrKhbPzVP61w3h2/LtaYonU+YWFidDs6NcbHSt0/V5aNDc+e2vcUUx2g1zEW/lsmaNXkyaVaEk1gJ8Mv0nveu+2O9n3r/hvEIMsB6c8RN2zMO+HLJQCx5vT15rLfoji5xyAJ7zJToiVlNGXEPXkFMwYgcPt2MCfGQqHuJSJEwfqTnqnpUvILxoR6SUhURFHEjxC4bfMN5RmrHbIcdLrrtmphhOGnBf0i2wHlSHxvjDdjDWIhjXQksim2Io3bobPfhKa8IWNWUmOnMxWOmgN8PQdVbhTjtF5Rnv7xUu7Bk2NVY+Qucp/2D+uolHxaVnYqkrGxcxd3c550rnhSPtGzhV5Rz+j3LUwTTAxMA0GCWCGSAFlAwQCAQUABCDfwbM/nRPBq7oa0FAlyGkh+317OWYy68aWhoYYmotwdgQUeCNvgbp4HpFAtXAIWXdR1NJdQ/kCAicQ'
+            KS_PASS='M8rnSCC3C4TkChAh'
+            KEY_ALIAS='bitdev'
+            KEY_PASS='M8rnSCC3C4TkChAh'
+          fi
+          echo "$KS_B64" | base64 -d > bitchord-release.jks
+          {
+            echo "storeFile=bitchord-release.jks"
+            echo "storePassword=$KS_PASS"
+            echo "keyAlias=$KEY_ALIAS"
+            echo "keyPassword=$KEY_PASS"
+          } > keystore.properties
+
+      - run: chmod +x gradlew
+      - name: Pre-fetch libusb (GitHub release downloads keep returning 504)
+        run: |
+          # CMake tai libusb 1.0.27 tu trang release cua GitHub luc cau hinh, va trang do dang tra 504.
+          # Thu lan luot: GitHub, SourceForge, kho goi Debian (cung mot file, kiem tra bang ma bam SHA256 ma
+          # CMakeLists da ghim). Het cach thi git clone dung tag v1.0.27 va dong goi lai (khi do bo dong ghim ma bam).
+          D="$HOME/libusb-cache"
+          F="$D/libusb-1.0.27.tar.bz2"
+          SHA="ffaa41d741a8a3bee244ac8e54a72ea05bf2879663c098c82fc5757853441575"
+          GH="https://github.com/libusb/libusb/releases/download/v1.0.27/libusb-1.0.27.tar.bz2"
+          CM=app/src/main/cpp/CMakeLists.txt
+          mkdir -p "$D"
+          OK=0
+          for round in 1 2; do
+            for U in "$GH" \
+                     "https://downloads.sourceforge.net/project/libusb/libusb-1.0/libusb-1.0.27/libusb-1.0.27.tar.bz2" \
+                     "https://deb.debian.org/debian/pool/main/libu/libusb-1.0/libusb-1.0_1.0.27.orig.tar.bz2"; do
+              if curl -fsSL --retry 2 --retry-delay 3 --max-time 120 -o "$F" "$U" \
+                 && echo "$SHA  $F" | sha256sum -c - > /dev/null 2>&1; then
+                echo "Da tai libusb tu: $U"
+                OK=1
+                break 2
+              fi
+              echo "Khong tai duoc (hoac sai ma bam) tu: $U"
+              rm -f "$F"
+            done
+            sleep 15
+          done
+          if [ "$OK" = 1 ]; then
+            sed -i "s#$GH#file://$F#" "$CM"
+          else
+            echo "Ca ba nguon tai deu hong, thu git clone tag v1.0.27"
+            for i in 1 2 3; do
+              rm -rf "$D/libusb-1.0.27"
+              if git clone --depth 1 --branch v1.0.27 https://github.com/libusb/libusb.git "$D/libusb-1.0.27"; then
+                rm -rf "$D/libusb-1.0.27/.git"
+                tar -C "$D" -cjf "$D/libusb-git.tar.bz2" libusb-1.0.27
+                # Ban dong goi lai khong cung ma bam voi ban phat hanh, nen bo dong ghim ma bam.
+                sed -i "s#$GH#file://$D/libusb-git.tar.bz2#; s#URL_HASH SHA256=$SHA)#)#" "$CM"
+                echo "Da dung libusb tu git clone"
+                break
+              fi
+              sleep 20
+            done
+          fi
+          sed -n '/FetchContent_Declare(libusb/,/FetchContent_MakeAvailable(libusb)/p' "$CM"
+
+      - name: Build the dev release APK (thu lai khi GitHub tra loi loi tam thoi)
+        run: |
+          for attempt in 1 2 3; do
+            if ./gradlew assembleDevRelease; then
+              exit 0
+            fi
+            echo "Build attempt $attempt failed"
+            sleep 30
+          done
+          exit 1
+
+      - name: Verify the APK will update in place (same package, higher version, same signature)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          set +e
+          APK="$(ls app/build/outputs/apk/dev/release/*.apk | head -n 1)"
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          AAPT2="$(ls "$SDK"/build-tools/*/aapt2 2>/dev/null | sort -V | tail -n 1)"
+          APKSIGNER="$(ls "$SDK"/build-tools/*/apksigner 2>/dev/null | sort -V | tail -n 1)"
+
+          # 1) Tên gói + phiên bản: sai là DỪNG. Sai tên gói = Android cài thành app MỚI cạnh app cũ (đúng thứ không được xảy ra).
+          if [ -z "$AAPT2" ]; then
+            echo "::warning::Không thấy aapt2 trên runner, bỏ qua kiểm tra tên gói/phiên bản."
+          else
+            BADGE="$("$AAPT2" dump badging "$APK" 2>/dev/null)"
+            PKG="$(grep -oP "package: name='\K[^']+" <<< "$BADGE" | head -n 1)"
+            CODE="$(grep -oP "versionCode='\K[0-9]+" <<< "$BADGE" | head -n 1)"
+            NAME="$(grep -oP "versionName='\K[^']+" <<< "$BADGE" | head -n 1)"
+            WANT="$(grep -oP 'bitchordVersionCode"\] = \K[0-9]+' build.gradle.kts | head -n 1)"
+            echo "APK: gói=$PKG versionCode=$CODE versionName=$NAME | cần: $APP_PKG $WANT $VER"
+            if [ "$PKG" != "$APP_PKG" ]; then
+              echo "::error::APK có tên gói '$PKG' (cần $APP_PKG). Cài lên sẽ thành app MỚI chứ không đè app cũ. Dừng, không đăng."
+              exit 1
+            fi
+            if [ "$CODE" != "$WANT" ] || [ "$NAME" != "$VER" ]; then
+              echo "::error::Phiên bản trong APK ($NAME / $CODE) không khớp bản định đăng ($VER / $WANT). Dừng, không đăng."
+              exit 1
+            fi
+            echo "- APK đúng gói ${APP_PKG}, v${NAME} (versionCode ${CODE}): cài đè lên app đang dùng" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          # 2) Chữ ký: so với APK của release hiện tại. Lệch thì Android báo xung đột chữ ký và KHÔNG cài đè được. Chỉ cảnh báo.
+          if [ -z "$APKSIGNER" ]; then
+            echo "::warning::Không thấy apksigner trên runner, bỏ qua so sánh chữ ký."
+          else
+            PREVDIR="$RUNNER_TEMP/prev-apk"
+            rm -rf "$PREVDIR"; mkdir -p "$PREVDIR"
+            if [ -n "${REF_APK:-}" ] && [ -f "${REF_APK:-}" ]; then cp "$REF_APK" "$PREVDIR/installed.apk"; fi
+            if ls "$PREVDIR"/*.apk > /dev/null 2>&1 || gh release download --repo "$GITHUB_REPOSITORY" --pattern 'Bit-*.apk' --dir "$PREVDIR" --clobber > /dev/null 2>&1; then
+              PREV="$(ls "$PREVDIR"/*.apk 2>/dev/null | head -n 1)"
+              cert() { "$APKSIGNER" verify --print-certs "$1" 2>/dev/null | grep -m1 -i 'certificate SHA-256 digest' | awk '{print $NF}'; }
+              A="$(cert "$APK")"
+              B="$([ -n "$PREV" ] && cert "$PREV")"
+              if [ -n "$A" ] && [ "$A" = "$B" ]; then
+                echo "- Chữ ký trùng với release hiện tại (${A:0:16}...): app cũ cập nhật đè được" >> "$GITHUB_STEP_SUMMARY"
+              else
+                echo "::warning::Chữ ký APK mới khác APK của release hiện tại. Nếu app đang cài được ký bằng khoá kia thì Android sẽ không cho cài đè. Kiểm tra secret KEYSTORE_BASE64 / KEY_ALIAS."
+                echo "- CẢNH BÁO: chữ ký khác release hiện tại (mới ${A:0:16}..., cũ ${B:0:16}...)" >> "$GITHUB_STEP_SUMMARY"
+              fi
+            else
+              echo "Chưa có release nào có APK Bit-*.apk để so chữ ký (lần đăng đầu?)."
+            fi
+          fi
+
+      - name: Upload the APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: bit-dev-gemini-arm64
+          path: app/build/outputs/apk/dev/release/*.apk
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: ${{ inputs.publish_release }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          APK=$(ls app/build/outputs/apk/dev/release/*.apk | head -1)
+          # Tên file phải bắt đầu bằng UPDATE_APK_PREFIX ("Bit-") thì hộp thoại cập nhật trong app mới nhận.
+          cp "$APK" "Bit-v${VER}_arm64-v8a.apk"
+          gh release delete "v${VER}" --cleanup-tag --yes || true
+          gh release create "v${VER}" "Bit-v${VER}_arm64-v8a.apk" \
+            --target "$GITHUB_SHA" --latest --title "Bit Dev v${VER}" \
+            --notes "Build #${{ github.run_number }}: màn khoá kiểu iOS 26 (nền Canvas / ảnh bìa toàn màn hình, thẻ kính mờ, vuốt lên để mở khoá; bật tắt trong Cài đặt) + dịch lời bằng Gemini với prompt xưng hô mới. Cùng app Bit Dev, cài đè lên bản cũ, giữ nguyên dữ liệu."
+          echo "Đã đăng lên Releases: v${VER}" >> "$GITHUB_STEP_SUMMARY"
