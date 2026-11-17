@@ -2,7 +2,7 @@ name: "Bit-dev ALL-IN-ONE: Automix + Canvas + Màn hình khóa Liquid Glass v2 +
 # BẢN SỬA: input bit_dev_app (mặc định BẬT) build đúng app Bit Dev đang cài (gói com.bit.dev, khoá ký của Bit Dev APK) để cập nhật ĐÈ,
 # không còn đẻ thêm app com.music.bitchord. Có thêm chốt chặn: cùng gói mà khác chữ ký / versionCode thấp hơn bản đang phát thì dừng trước khi đăng.
 # Runner ghim ubuntu-24.04 (ubuntu-latest giờ là 26.04, thiếu Android SDK ở đường dẫn cũ).
-# Ảnh bìa màn khoá v2: chiếm 82% bề rộng, 4 mép tan mờ vào bản sao mờ của chính ảnh.
+# Ảnh bìa màn khoá v2: nằm giữa clock và player, chiếm hết bề rộng, mép trái/phải mờ 14%, trên/dưới mờ 16%/14%. Thẻ player nhỏ gọn hơn vào bản sao mờ của chính ảnh.
 
 # ======================================================================================
 # MỘT FILE duy nhất. Chạy tay: Actions -> chọn workflow này -> Run workflow.
@@ -1744,14 +1744,14 @@ jobs:
                   shape = shape,
                   modifier = modifier
                       .fillMaxWidth()
-                      .padding(horizontal = 16.dp),
-                  contentPadding = PaddingValues(start = 26.dp, end = 26.dp, top = 22.dp, bottom = 16.dp),
+                      .padding(horizontal = 28.dp),
+                  contentPadding = PaddingValues(start = 22.dp, end = 22.dp, top = 16.dp, bottom = 12.dp),
               ) {
                   // A long title drifts sideways instead of ending in an ellipsis.
                   Text(
                       text = title,
                       color = Color.White,
-                      fontSize = 21.sp,
+                      fontSize = 19.sp,
                       fontWeight = FontWeight.Bold,
                       maxLines = 1,
                       overflow = TextOverflow.Clip,
@@ -1760,11 +1760,11 @@ jobs:
                   Text(
                       text = artist,
                       color = Color.White.copy(alpha = 0.72f),
-                      fontSize = 16.sp,
+                      fontSize = 14.sp,
                       maxLines = 1,
                       overflow = TextOverflow.Ellipsis,
                   )
-                  Spacer(Modifier.height(12.dp))
+                  Spacer(Modifier.height(8.dp))
                   ThinSlider(
                       value = scrubbing ?: progress,
                       onValueChange = { scrub = it },
@@ -1801,26 +1801,26 @@ jobs:
                       horizontalArrangement = Arrangement.SpaceEvenly,
                       verticalAlignment = Alignment.CenterVertically,
                   ) {
-                      ControlButton(onClick = onPrevious, touch = 68.dp) {
-                          Icon(Icons.Rounded.SkipPrevious, contentDescription = null, tint = Color.White, modifier = Modifier.size(42.dp))
+                      ControlButton(onClick = onPrevious, touch = 56.dp) {
+                          Icon(Icons.Rounded.SkipPrevious, contentDescription = null, tint = Color.White, modifier = Modifier.size(36.dp))
                       }
-                      ControlButton(onClick = onPlayPause, touch = 84.dp) {
-                          GlassDisc(size = 68.dp) {
+                      ControlButton(onClick = onPlayPause, touch = 68.dp) {
+                          GlassDisc(size = 56.dp) {
                               Crossfade(targetState = isPlaying, animationSpec = tween(180), label = "playPause") { playing ->
                                   Icon(
                                       imageVector = if (playing) Icons.Rounded.Pause else Icons.Rounded.PlayArrow,
                                       contentDescription = null,
                                       tint = Color.White,
-                                      modifier = Modifier.size(44.dp),
+                                      modifier = Modifier.size(38.dp),
                                   )
                               }
                           }
                       }
-                      ControlButton(onClick = onNext, touch = 68.dp) {
-                          Icon(Icons.Rounded.SkipNext, contentDescription = null, tint = Color.White, modifier = Modifier.size(42.dp))
+                      ControlButton(onClick = onNext, touch = 56.dp) {
+                          Icon(Icons.Rounded.SkipNext, contentDescription = null, tint = Color.White, modifier = Modifier.size(36.dp))
                       }
                   }
-                  Spacer(Modifier.height(10.dp))
+                  Spacer(Modifier.height(6.dp))
                   VolumeBar()
               }
           }
@@ -2929,7 +2929,7 @@ jobs:
                           // up to the height of the screen (which crops the sides off and magnifies it two
                           // or three times over, so the subject is lost). Its top and bottom edges dissolve
                           // into the blurred copy behind it, for as long as the clock / the player are up.
-                          Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                          Box(Modifier.fillMaxSize(), contentAlignment = androidx.compose.ui.BiasAlignment(0f, CoverVerticalBias)) {
                               AsyncImage(
                                   model = sharp,
                                   contentDescription = null,
@@ -2953,22 +2953,29 @@ jobs:
           }
 
           /** How far in from the top / bottom of the SCREEN the blurred edge reaches (clock / player zone). */
-          private const val EdgeBlurTop = 0.28f
-          private const val EdgeBlurBottom = 0.36f
+          private const val EdgeBlurTop = 0.20f
+          private const val EdgeBlurBottom = 0.28f
 
           /** How far in from the top / bottom of a squarer cover's OWN height it dissolves. */
-          private const val CoverFeatherTop = 0.30f
-          private const val CoverFeatherBottom = 0.34f
+          private const val CoverFeatherTop = 0.16f
+          private const val CoverFeatherBottom = 0.14f
 
           /**
            * A squarer cover is no longer laid edge to edge: it takes this share of the screen width, and the rest
            * is the soft, blurred copy of itself, so the picture sits in the screen like a photo with a feathered
            * edge instead of filling it.
            */
-          private const val CoverWidthFrac = 0.82f
+          private const val CoverWidthFrac = 1.0f
 
           /** How far in from the left / right of that cover its edge dissolves into the blurred copy. */
-          private const val CoverFeatherSide = 0.24f
+          private const val CoverFeatherSide = 0.14f
+
+          /**
+           * Where the cover sits up and down, as a bias of the free height: 0 is the middle of the screen, -1 the top.
+           * -0.15 puts a square cover's top about a fifth of the way down, so it fills the space between the clock and
+           * the (now smaller) player instead of sitting in the exact middle of the screen.
+           */
+          private const val CoverVerticalBias = -0.15f
 
           /** The left / right counterpart of [edgeBrush]: 0 at both side edges, easing up to 1 inside. */
           private fun sideBrush(frac: Float): Brush {
