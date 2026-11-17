@@ -1,0 +1,119 @@
+name: Kiểm tra app có thấy cập nhật không (chạy 10 giây)
+
+# Làm đúng những gì app BitChord làm khi tự kiểm tra cập nhật (AppUpdateChecker.kt):
+#   1. Hỏi GitHub "release mới nhất" (không tính bản nháp và pre-release).
+#   2. Lấy file .apk có tên bắt đầu bằng "Bit-" và đã tải lên xong. Ưu tiên bản không có _ABI, không có thì bản _arm64-v8a.
+#   3. So số phiên bản TỪNG SỐ MỘT với bản đang cài (1.9.1.36 > 1.9.1.31, nhưng 1.9.1.36 < 1.9.31 vì 1 < 31).
+# Chạy xong mở Summary của lần chạy: có kết luận app của bạn SẼ hay KHÔNG thấy cập nhật, và lý do.
+# Không build gì, không đụng repo, chỉ đọc.
+
+on:
+  workflow_dispatch:
+    inputs:
+      installed_version:
+        description: "Phiên bản đang hiện trong app cũ (Cài đặt, dòng cuối trang). Ví dụ 1.9.1.31"
+        type: string
+        default: "1.9.1.31"
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Mô phỏng đúng cách app tự kiểm tra cập nhật
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OLD: ${{ inputs.installed_version }}
+        run: |
+          set +e
+          python3 - <<'PY'
+          import json, os, re, subprocess
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          old = (os.environ.get("OLD") or "").strip().lstrip("vV")
+          out = []
+
+          def say(line=""):
+              out.append(line)
+              print(line)
+
+          def gh(path):
+              r = subprocess.run(["gh", "api", path], capture_output=True, text=True)
+              return r.returncode, r.stdout, r.stderr
+
+          def parse(v):
+              base = v.split("-")[0]
+              return [int(x) if x.isdigit() else 0 for x in base.split(".")], "-" in v
+
+          def is_newer(latest, current):
+              (l, _), (c, c_pre) = parse(latest), parse(current)
+              for i in range(max(len(l), len(c))):
+                  a = l[i] if i < len(l) else 0
+                  b = c[i] if i < len(c) else 0
+                  if a != b:
+                      return a > b
+              return c_pre
+
+          # --- all releases, for the overview ---
+          rc, body, err = gh(f"repos/{repo}/releases?per_page=15")
+          say("## Các release trong repo")
+          if rc == 0:
+              rels = json.loads(body or "[]")
+              if not rels:
+                  say("- (không có release nào)")
+              for r in rels:
+                  flags = []
+                  if r.get("draft"): flags.append("NHÁP")
+                  if r.get("prerelease"): flags.append("PRE-RELEASE")
+                  names = ", ".join(a["name"] for a in r.get("assets", [])) or "không có file"
+                  say(f"- `{r['tag_name']}` {' '.join(flags)} | {names}")
+          else:
+              say(f"- Không đọc được danh sách: {err.strip()[:200]}")
+
+          # --- what the app asks for ---
+          say("")
+          say("## Cái app nhìn thấy (releases/latest)")
+          rc, body, err = gh(f"repos/{repo}/releases/latest")
+          if rc != 0:
+              say("- GitHub không trả về release mới nhất nào (không có release, hoặc chỉ toàn bản nháp / pre-release).")
+              say("- **KẾT LUẬN: app KHÔNG thấy cập nhật.** Cần một release thật (không nháp, không pre-release) có file Bit-*.apk.")
+              verdict = "no_release"
+          else:
+              rel = json.loads(body)
+              tag = rel["tag_name"]
+              latest = tag[1:] if tag.startswith("v") else tag
+              say(f"- Release mới nhất: `{tag}` (đăng {rel.get('published_at', '?')})")
+              apks = []
+              for a in rel.get("assets", []):
+                  n = a.get("name", "")
+                  if n.lower().startswith("bit-") and n.lower().endswith(".apk") and a.get("state") == "uploaded":
+                      apks.append(n[:-4])
+              universal = [n for n in apks if "_" not in n]
+              abi = [n for n in apks if n.endswith("_arm64-v8a")]
+              picked = (universal or abi or [None])[0]
+              if picked:
+                  say(f"- File app sẽ tải: `{picked}.apk`")
+              else:
+                  say("- KHÔNG có file `Bit-….apk` hợp lệ: nút cập nhật chỉ mở trang Releases chứ không tải được.")
+              if not old:
+                  say("- Bạn chưa điền phiên bản đang cài nên chưa so được.")
+                  verdict = "unknown"
+              elif is_newer(latest, old):
+                  say(f"- So số: **{latest} lớn hơn {old}**.")
+                  say(f"- **KẾT LUẬN: app {old} SẼ thấy cập nhật lên {latest}.** Vuốt tắt hẳn app rồi mở lại; app chỉ kiểm khi mở hoặc quay lại, cách nhau ít nhất 10 phút.")
+                  verdict = "yes"
+              else:
+                  lp, _ = parse(latest); op, _ = parse(old)
+                  bump = op[:] ; bump[-1] += 1
+                  say(f"- So số từng số một: **{latest} KHÔNG lớn hơn {old}**.")
+                  say(f"- **KẾT LUẬN: app {old} KHÔNG thấy cập nhật.**")
+                  say(f"- Cách sửa: chạy lại workflow build, điền ô `version` = `{'.'.join(str(x) for x in bump)}` (hoặc lớn hơn), để bản mới lớn hơn bản trong app.")
+                  verdict = "no_older"
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
+              f.write("\n".join(out) + "\n")
+          PY
